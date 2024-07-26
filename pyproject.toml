@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "batchwizard"
+version = "0.1.0"
+description = ""
+authors = ["Carl Kugblenu"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/cmakafui/batchwizard"
+repository = "https://github.com/cmakafui/batchwizard"
+keywords = ["openai", "batch", "cli", "async"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+typer = "^0.12.3"
+rich = "^13.7.1"
+openai = "^1.37.0"
+pydantic = "^2.8.2"
+aiofiles = "^24.1.0"
+loguru = "^0.7.2"
+pydantic-settings = "^2.3.4"
+python-dotenv = "^1.0.1"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.2"
+pytest-asyncio = "^0.23.8"
+isort = "^5.13.2"
+black = "^24.4.2"
+ruff = "^0.5.5"
+pytest-mock = "^3.14.0"
+
+[tool.poetry.scripts]
+batchwizard = "batchwizard.cli:app"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
