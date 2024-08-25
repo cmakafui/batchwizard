@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "batchwizard"
-version = "0.1.0"
+version = "0.2.0"
 description = "BatchWizard: Manage OpenAI batch processing jobs with ease"
 authors = ["Carl Kugblenu"]
 license = "MIT"

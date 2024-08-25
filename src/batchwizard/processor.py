@@ -118,12 +118,20 @@ class BatchProcessor:
                 check_interval * 1.5, 60
             )  # Implement exponential backoff
 
-    async def process_directory(
-        self, input_dir: Path, output_dir: Path
+    async def process_inputs(
+        self, input_paths: List[Path], output_dir: Path
     ) -> List[BatchJobResult]:
-        input_files = list(input_dir.glob("*_batch_*.jsonl"))
+        input_files = []
+        for path in input_paths:
+            if path.is_dir():
+                input_files.extend(path.glob("*.jsonl"))
+            elif path.suffix.lower() == ".jsonl":
+                input_files.append(path)
+            else:
+                logger.warning(f"Skipping non-JSONL file: {path}")
+
         if not input_files:
-            logger.warning(f"No input files found in {input_dir}")
+            logger.warning("No input files found in the provided paths")
             return []
 
         semaphore = asyncio.Semaphore(self.settings.max_concurrent_jobs)

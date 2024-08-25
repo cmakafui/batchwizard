@@ -128,7 +128,7 @@ class BatchWizardUI:
         layout["body"]["sidebar"]["logs"].update(log_panel)
 
     async def run_processing(
-        self, processor: BatchProcessor, input_dir: Path, output_dir: Path
+        self, processor: BatchProcessor, input_paths: List[Path], output_dir: Path
     ):
         layout = self.create_layout()
         overall_progress, job_progress = self.create_progress_bars()
@@ -150,9 +150,17 @@ class BatchWizardUI:
         with Live(layout, console=self.console, screen=True, refresh_per_second=4):
             await update_ui()
 
-            input_files = list(input_dir.glob("*_batch_*.jsonl"))
+            input_files = []
+            for path in input_paths:
+                if path.is_dir():
+                    input_files.extend(path.glob("*.jsonl"))
+                elif path.suffix.lower() == ".jsonl":
+                    input_files.append(path)
+                else:
+                    self.add_log(f"Skipping non-JSONL file: {path}")
+
             if not input_files:
-                self.add_log(f"No input files found in {input_dir}")
+                self.add_log("No input files found in the provided paths")
                 await update_ui()
                 return
 

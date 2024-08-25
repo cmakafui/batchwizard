@@ -20,8 +20,8 @@ logger = setup_logger(console)
 
 @app.command()
 def process(
-    input_directory: Path = typer.Argument(
-        ..., help="Directory containing input files for processing"
+    input_paths: list[Path] = typer.Argument(
+        ..., help="Paths to input files or directories for processing"
     ),
     output_directory: Optional[Path] = typer.Option(
         None, help="Directory to store output files"
@@ -33,15 +33,15 @@ def process(
         5, help="Initial interval (in seconds) between job status checks"
     ),
 ):
-    """Process batch jobs from input files in the specified directory."""
+    """Process batch jobs from input files or directories."""
     if not output_directory:
-        output_directory = input_directory / "results"
+        output_directory = Path.cwd() / "results"
     output_directory.mkdir(parents=True, exist_ok=True)
 
     api_key = get_api_key()
     if not api_key:
         logger.error(
-            "API key not set. Please set it using 'batchwizard configure --set-key YOUR_API_KEY'"
+            "API key not set. Please set it using 'openaibatch configure --set-key YOUR_API_KEY'"
         )
         raise typer.Exit(code=1)
 
@@ -54,11 +54,12 @@ def process(
 
     async def run_and_close():
         try:
-            await ui.run_processing(processor, input_directory, output_directory)
+            await ui.run_processing(processor, input_paths, output_directory)
         finally:
             await processor.close()
 
     asyncio.run(run_and_close())
+
 
 
 @app.command()

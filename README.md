@@ -36,11 +36,13 @@ BatchWizard provides a command-line interface (CLI) for managing batch jobs. Her
 
 ### Process Batch Jobs
 
-To process a directory containing input files:
+To process input files or directories:
 
 ```bash
-batchwizard process <input_directory> [--output-directory OUTPUT_DIR] [--max-concurrent-jobs NUM] [--check-interval SECONDS]
+batchwizard process <input_paths>... [--output-directory OUTPUT_DIR] [--max-concurrent-jobs NUM] [--check-interval SECONDS]
 ```
+
+You can provide multiple input paths, which can be individual JSONL files or directories containing JSONL files.
 
 #### Example with Sample Input
 
@@ -59,13 +61,19 @@ To process this file using BatchWizard:
    ```
 2. Then, run the process command:
    ```bash
-   batchwizard process /path/to/directory/containing/batchinput.jsonl --output-directory /path/to/output
+   batchwizard process /path/to/batchinput.jsonl --output-directory /path/to/output
    ```
    This command will:
    - Upload the `batchinput.jsonl` file to OpenAI
    - Create a batch job
    - Monitor the job status
    - Download the results to the specified output directory when complete
+
+You can also process multiple files or directories:
+
+```bash
+batchwizard process /path/to/file1.jsonl /path/to/directory_with_jsonl_files /path/to/file2.jsonl
+```
 
 ### List Recent Jobs
 
@@ -121,12 +129,13 @@ batchwizard configure --reset
 
 BatchWizard supports the following commands:
 
-- `process`: Process batch jobs from input files in the specified directory.
+- `process`: Process batch jobs from input files or directories.
 - `configure`: Manage BatchWizard configuration.
 - `list-jobs`: List recent batch jobs.
 - `cancel`: Cancel a specific batch job.
 - `download`: Download results for a completed batch job.
-  For detailed information on each command, use the `--help` option:
+
+For detailed information on each command, use the `--help` option:
 
 ```bash
 batchwizard <command> --help
@@ -134,6 +143,7 @@ batchwizard <command> --help
 
 ## Features
 
+- **Flexible Input**: Process individual JSONL files or entire directories containing JSONL files.
 - **Asynchronous Processing**: Efficiently handle multiple batch jobs concurrently.
 - **Rich UI**: Display progress and job status using a rich, interactive interface.
 - **Flexible Configuration**: Easily manage API keys and other settings.
