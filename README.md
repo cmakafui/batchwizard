@@ -42,6 +42,31 @@ To process a directory containing input files:
 batchwizard process <input_directory> [--output-directory OUTPUT_DIR] [--max-concurrent-jobs NUM] [--check-interval SECONDS]
 ```
 
+#### Example with Sample Input
+
+Let's say you have a file named `batchinput.jsonl` with the following content:
+
+```jsonl
+{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "You are a helpful assistant."},{"role": "user", "content": "Hello world!"}],"max_tokens": 1000}}
+{"custom_id": "request-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "You are an unhelpful assistant."},{"role": "user", "content": "Hello world!"}],"max_tokens": 1000}}
+```
+
+To process this file using BatchWizard:
+
+1. First, ensure your OpenAI API key is set:
+   ```bash
+   batchwizard configure --set-key YOUR_API_KEY
+   ```
+2. Then, run the process command:
+   ```bash
+   batchwizard process /path/to/directory/containing/batchinput.jsonl --output-directory /path/to/output
+   ```
+   This command will:
+   - Upload the `batchinput.jsonl` file to OpenAI
+   - Create a batch job
+   - Monitor the job status
+   - Download the results to the specified output directory when complete
+
 ### List Recent Jobs
 
 To list recent batch jobs:
@@ -101,8 +126,7 @@ BatchWizard supports the following commands:
 - `list-jobs`: List recent batch jobs.
 - `cancel`: Cancel a specific batch job.
 - `download`: Download results for a completed batch job.
-
-For detailed information on each command, use the `--help` option:
+  For detailed information on each command, use the `--help` option:
 
 ```bash
 batchwizard <command> --help
