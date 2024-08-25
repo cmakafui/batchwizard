@@ -2,6 +2,8 @@
 
 BatchWizard is a powerful CLI tool for managing OpenAI batch processing jobs with ease. It provides functionalities to upload files, create batch jobs, check their status, and download the results. The tool uses asynchronous processing to efficiently handle multiple jobs concurrently.
 
+![image](https://github.com/user-attachments/assets/8084afbd-fd05-43b3-b57c-2ea1eb70a457)
+
 ## Table of Contents
 
 - [Installation](#installation)
