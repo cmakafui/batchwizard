@@ -12,7 +12,9 @@ class BatchWizardSettings(BaseSettings):
     api_key: Optional[str] = Field(None, env="OPENAI_API_KEY")
     max_concurrent_jobs: int = 5
     check_interval: int = 5
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
 
 class Config(BaseModel):
