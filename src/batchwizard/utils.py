@@ -1,5 +1,4 @@
 # utils.py
-from typing import Optional
 
 from loguru import logger
 from rich.console import Console
@@ -21,7 +20,7 @@ def setup_logger(console: Console = None):
     return logger
 
 
-def get_api_key() -> Optional[str]:
+def get_api_key() -> str | None:
     """Get the API key from config or environment variable."""
     return config.get_api_key()
 

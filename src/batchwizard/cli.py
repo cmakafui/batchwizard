@@ -2,7 +2,6 @@
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -23,7 +22,7 @@ def process(
     input_paths: list[Path] = typer.Argument(
         ..., help="Paths to input files or directories for processing"
     ),
-    output_directory: Optional[Path] = typer.Option(
+    output_directory: Path | None = typer.Option(
         None, help="Directory to store output files"
     ),
     max_concurrent_jobs: int = typer.Option(
@@ -41,13 +40,13 @@ def process(
     api_key = get_api_key()
     if not api_key:
         logger.error(
-            "API key not set. Please set it using 'openaibatch configure --set-key YOUR_API_KEY'"
+            "API key not set. Please set it using 'batchwizard configure --set-key YOUR_API_KEY'"
         )
         raise typer.Exit(code=1)
 
+    # Per-run overrides only — not persisted to the saved configuration
     config.settings.max_concurrent_jobs = max_concurrent_jobs
     config.settings.check_interval = check_interval
-    config.save()
 
     processor = BatchProcessor()
     ui = BatchWizardUI(Console())
@@ -61,10 +60,9 @@ def process(
     asyncio.run(run_and_close())
 
 
-
 @app.command()
 def configure(
-    set_key: Optional[str] = typer.Option(
+    set_key: str | None = typer.Option(
         None, "--set-key", help="Set the OpenAI API key"
     ),
     show: bool = typer.Option(False, "--show", help="Show the current configuration"),

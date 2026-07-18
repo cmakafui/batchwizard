@@ -1,37 +1,75 @@
-[tool.poetry]
+[project]
 name = "batchwizard"
-version = "0.2.0"
+version = "0.3.0"
 description = "BatchWizard: Manage OpenAI batch processing jobs with ease"
-authors = ["Carl Kugblenu"]
-license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/cmakafui/batchwizard"
-repository = "https://github.com/cmakafui/batchwizard"
+license = "MIT"
+authors = [{ name = "Carl Kugblenu" }]
+requires-python = ">=3.11"
 keywords = ["openai", "batch", "cli", "async"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "openai>=1.37",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.3",
+    "aiofiles>=24.1",
+    "loguru>=0.7",
+    "python-dotenv>=1.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.9"
-typer = "^0.12.3"
-rich = "^13.7.1"
-openai = "^1.37.0"
-pydantic = "^2.8.2"
-aiofiles = "^24.1.0"
-loguru = "^0.7.2"
-pydantic-settings = "^2.3.4"
-python-dotenv = "^1.0.1"
+[project.urls]
+Homepage = "https://github.com/cmakafui/batchwizard"
+Repository = "https://github.com/cmakafui/batchwizard"
+Issues = "https://github.com/cmakafui/batchwizard/issues"
 
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.3.2"
-pytest-asyncio = "^0.23.8"
-isort = "^5.13.2"
-black = "^24.4.2"
-ruff = "^0.5.5"
-pytest-mock = "^3.14.0"
-
-[tool.poetry.scripts]
+[project.scripts]
 batchwizard = "batchwizard.cli:app"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.14",
+    "ruff>=0.5",
+]
+
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/batchwizard"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "UP", # pyupgrade
+    "B",  # flake8-bugbear
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer declares CLI params via function-call defaults by design
+"src/batchwizard/cli.py" = ["B008"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
