@@ -2,15 +2,20 @@
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import List
 
 from loguru import logger
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import (BarColumn, Progress, SpinnerColumn,
-                           TaskProgressColumn, TextColumn, TimeElapsedColumn)
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
@@ -68,7 +73,9 @@ class BatchWizardUI:
         color = (
             "green"
             if status == "completed"
-            else "red" if status in ["failed", "expired", "cancelled"] else "yellow"
+            else "red"
+            if status in ["failed", "expired", "cancelled"]
+            else "yellow"
         )
         self.jobs[job_id] = (f"[{color}]{status}", progress)
         self.job_table = self.create_job_table()
@@ -128,7 +135,7 @@ class BatchWizardUI:
         layout["body"]["sidebar"]["logs"].update(log_panel)
 
     async def run_processing(
-        self, processor: BatchProcessor, input_paths: List[Path], output_dir: Path
+        self, processor: BatchProcessor, input_paths: list[Path], output_dir: Path
     ):
         layout = self.create_layout()
         overall_progress, job_progress = self.create_progress_bars()
@@ -219,7 +226,7 @@ class BatchWizardUI:
         if self.completed_jobs > 0:
             self.console.print(f"Results saved in: {output_dir}")
 
-    def display_job_list(self, jobs: List[dict]):
+    def display_job_list(self, jobs: list[dict]):
         table = Table(title="Batch Jobs")
         table.add_column("Job ID", style="cyan")
         table.add_column("Status", style="magenta")

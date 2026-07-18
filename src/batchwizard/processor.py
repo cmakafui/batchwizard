@@ -1,7 +1,6 @@
 # processor.py
 import asyncio
 from pathlib import Path
-from typing import List, Optional
 
 import aiofiles
 from loguru import logger
@@ -16,7 +15,7 @@ class BatchProcessor:
         self.client = AsyncOpenAI(api_key=config.get_api_key())
         self.settings = config.settings
 
-    async def upload_file(self, file_path: Path) -> Optional[str]:
+    async def upload_file(self, file_path: Path) -> str | None:
         try:
             async with aiofiles.open(file_path, "rb") as file:
                 file_content = await file.read()
@@ -32,7 +31,7 @@ class BatchProcessor:
             logger.error(f"Error uploading file {file_path.name}: {str(e)}")
             return None
 
-    async def create_batch_job(self, input_file_id: str) -> Optional[BatchJob]:
+    async def create_batch_job(self, input_file_id: str) -> BatchJob | None:
         try:
             batch_job = await self.client.batches.create(
                 input_file_id=input_file_id,
@@ -49,7 +48,7 @@ class BatchProcessor:
             logger.error(f"Error creating batch job: {str(e)}")
             return None
 
-    async def check_batch_status(self, batch_id: str) -> Optional[str]:
+    async def check_batch_status(self, batch_id: str) -> str | None:
         try:
             batch_job = await self.client.batches.retrieve(batch_id)
             return self.normalize_status(batch_job.status)
@@ -119,8 +118,8 @@ class BatchProcessor:
             )  # Implement exponential backoff
 
     async def process_inputs(
-        self, input_paths: List[Path], output_dir: Path
-    ) -> List[BatchJobResult]:
+        self, input_paths: list[Path], output_dir: Path
+    ) -> list[BatchJobResult]:
         input_files = []
         for path in input_paths:
             if path.is_dir():
@@ -136,7 +135,7 @@ class BatchProcessor:
 
         semaphore = asyncio.Semaphore(self.settings.max_concurrent_jobs)
 
-        async def process_file(input_file: Path) -> Optional[BatchJobResult]:
+        async def process_file(input_file: Path) -> BatchJobResult | None:
             async with semaphore:
                 file_id = await self.upload_file(input_file)
                 if file_id:
