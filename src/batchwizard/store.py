@@ -15,13 +15,40 @@ from .models import (
     utcnow,
 )
 
-_LATEST_SCHEMA_VERSION = 1
+_LATEST_SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL,
-    batch_id TEXT NOT NULL UNIQUE,
+    intent_id TEXT NOT NULL UNIQUE,
+    batch_id TEXT,
+    input_path TEXT NOT NULL,
+    endpoint TEXT,
+    state TEXT NOT NULL,
+    provider_status TEXT NOT NULL DEFAULT '',
+    collection_state TEXT NOT NULL DEFAULT 'not_ready',
+    completed_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    cancelled_count INTEGER NOT NULL DEFAULT 0,
+    expired_count INTEGER NOT NULL DEFAULT 0,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    output_path TEXT,
+    error_path TEXT,
+    error_summary TEXT,
+    last_local_error TEXT,
+    poll_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider, batch_id)
+);
+"""
+
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
     input_path TEXT NOT NULL,
     endpoint TEXT NOT NULL,
     state TEXT NOT NULL,
@@ -38,12 +65,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_local_error TEXT,
     poll_failures INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider, batch_id)
 );
 """
 
 _FIELDS = [
     "provider",
+    "intent_id",
     "batch_id",
     "input_path",
     "endpoint",
@@ -95,6 +124,12 @@ class JobStore:
             )
         if version == 0:
             self._migrate_v0_to_v1()
+            version = 1
+        if version == 1:
+            self._migrate_v1_to_v2()
+            version = 2
+        if version == 2:
+            self._migrate_v2_to_v3()
 
     def _migrate_v0_to_v1(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(jobs)")}
@@ -137,6 +172,41 @@ class JobStore:
             )
             self.conn.execute("PRAGMA user_version = 1")
 
+    def _migrate_v1_to_v2(self) -> None:
+        """Make provider + batch ID the durable identity."""
+        fields = ", ".join(
+            ["id", *(field for field in _FIELDS if field != "intent_id")]
+        )
+        with self.conn:
+            self.conn.execute("ALTER TABLE jobs RENAME TO jobs_v1")
+            self.conn.execute(_SCHEMA_V2)
+            self.conn.execute(
+                f"INSERT INTO jobs ({fields}) SELECT {fields} FROM jobs_v1"
+            )
+            self.conn.execute("DROP TABLE jobs_v1")
+            self.conn.execute("PRAGMA user_version = 2")
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Persist submission intents before a provider assigns a batch ID."""
+        old_fields = [field for field in _FIELDS if field != "intent_id"]
+        destination = ", ".join(["id", *_FIELDS])
+        source = ", ".join(
+            [
+                "id",
+                "provider",
+                "'legacy-' || id",
+                *old_fields[1:],
+            ]
+        )
+        with self.conn:
+            self.conn.execute("ALTER TABLE jobs RENAME TO jobs_v2")
+            self.conn.execute(_SCHEMA)
+            self.conn.execute(
+                f"INSERT INTO jobs ({destination}) SELECT {source} FROM jobs_v2"
+            )
+            self.conn.execute("DROP TABLE jobs_v2")
+            self.conn.execute("PRAGMA user_version = 3")
+
     def add(self, job: JobRecord) -> JobRecord:
         cur = self.conn.execute(
             f"INSERT INTO jobs ({', '.join(_FIELDS)}) VALUES ({', '.join('?' * len(_FIELDS))})",
@@ -149,17 +219,52 @@ class JobStore:
     def update(self, job: JobRecord) -> None:
         job.updated_at = utcnow()
         assignments = ", ".join(f"{f} = ?" for f in _FIELDS)
-        self.conn.execute(
-            f"UPDATE jobs SET {assignments} WHERE batch_id = ?",
-            [getattr(job, f) for f in _FIELDS] + [job.batch_id],
-        )
+        values = [getattr(job, f) for f in _FIELDS]
+        if job.id is not None:
+            self.conn.execute(
+                f"UPDATE jobs SET {assignments} WHERE id = ?", values + [job.id]
+            )
+        else:
+            self.conn.execute(
+                f"UPDATE jobs SET {assignments} WHERE intent_id = ?",
+                values + [job.intent_id],
+            )
         self.conn.commit()
 
-    def get(self, batch_id: str) -> JobRecord | None:
+    def get(self, batch_id: str, provider: str | None = None) -> JobRecord | None:
+        if provider is not None:
+            row = self.conn.execute(
+                "SELECT * FROM jobs WHERE provider = ? AND batch_id = ?",
+                (provider, batch_id),
+            ).fetchone()
+            return JobRecord(**dict(row)) if row else None
+
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE batch_id = ? ORDER BY id", (batch_id,)
+        ).fetchall()
+        if len(rows) > 1:
+            providers = ", ".join(row["provider"] for row in rows)
+            raise AmbiguousJobError(
+                f"Batch ID {batch_id!r} exists for multiple providers: {providers}. "
+                "Specify --provider."
+            )
+        return JobRecord(**dict(rows[0])) if rows else None
+
+    def get_intent(self, intent_id: str) -> JobRecord | None:
         row = self.conn.execute(
-            "SELECT * FROM jobs WHERE batch_id = ?", (batch_id,)
+            "SELECT * FROM jobs WHERE intent_id = ?", (intent_id,)
         ).fetchone()
         return JobRecord(**dict(row)) if row else None
+
+    def unresolved(self) -> list[JobRecord]:
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE batch_id IS NULL ORDER BY id"
+        ).fetchall()
+        return [JobRecord(**dict(row)) for row in rows]
+
+    def delete(self, job: JobRecord) -> None:
+        self.conn.execute("DELETE FROM jobs WHERE intent_id = ?", (job.intent_id,))
+        self.conn.commit()
 
     def list(self, states: Set[JobState] | None = None) -> list[JobRecord]:
         if states:
@@ -199,3 +304,7 @@ class JobStore:
 
     def close(self) -> None:
         self.conn.close()
+
+
+class AmbiguousJobError(ValueError):
+    """A provider is required to select a non-unique native batch ID."""

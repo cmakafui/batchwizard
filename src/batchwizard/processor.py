@@ -6,15 +6,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from anthropic import APIConnectionError as AnthropicConnectionError
 from loguru import logger
+from openai import APIConnectionError as OpenAIConnectionError
 
 from .models import (
     TERMINAL_STATES,
     BatchStatus,
     CollectionState,
     JobRecord,
+    JobState,
 )
-from .providers.base import BatchProvider
+from .providers.base import ArtifactUnavailableError, BatchProvider
 from .store import JobStore
 from .utils import discover_jsonl
 
@@ -43,6 +46,10 @@ class BatchOrchestrator:
         check_interval: float = 5,
         max_concurrent_jobs: int = 5,
     ):
+        if max_concurrent_jobs < 1:
+            raise ValueError("max_concurrent_jobs must be at least 1")
+        if check_interval < 0:
+            raise ValueError("check_interval cannot be negative")
         self.provider = provider
         self.store = store
         self.on_event = on_event
@@ -54,7 +61,7 @@ class BatchOrchestrator:
             self.on_event(JobEvent(kind=kind, job=job, message=message))
 
     async def submit_paths(
-        self, input_paths: list[Path], endpoint: str = "/v1/chat/completions"
+        self, input_paths: list[Path], endpoint: str | None = None
     ) -> list[JobRecord]:
         """Upload inputs, create batches, and record them in the manifest."""
         files = discover_jsonl(input_paths)
@@ -63,29 +70,57 @@ class BatchOrchestrator:
             return []
 
         semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
+        intents = [
+            (
+                input_file,
+                self.store.add(
+                    JobRecord(
+                        provider=self.provider.name,
+                        input_path=str(input_file),
+                        endpoint=endpoint,
+                        state=JobState.SUBMITTING,
+                        provider_status="submitting",
+                    )
+                ),
+            )
+            for input_file in files
+        ]
 
-        async def submit_one(input_file: Path) -> JobRecord | None:
+        async def submit_one(input_file: Path, job: JobRecord) -> JobRecord | None:
             async with semaphore:
                 try:
-                    batch_id = await self.provider.submit(input_file, endpoint)
-                except Exception as e:
-                    logger.error(f"Failed to submit {input_file.name}: {e}")
+                    submitted = await self.provider.submit(
+                        input_file, endpoint, intent_id=job.intent_id
+                    )
+                except ValueError as e:
+                    self.store.delete(job)
+                    logger.error(f"Rejected {input_file.name} before submission: {e}")
                     self._emit(
-                        "log", message=f"Failed to submit {input_file.name}: {e}"
+                        "log",
+                        message=f"Rejected {input_file.name} before submission: {e}",
                     )
                     return None
-            job = self.store.add(
-                JobRecord(
-                    provider=self.provider.name,
-                    batch_id=batch_id,
-                    input_path=str(input_file),
-                    endpoint=endpoint,
-                )
-            )
+                except Exception as e:
+                    job.last_local_error = (
+                        f"Submission outcome unknown: {e}. Reconcile intent "
+                        f"{job.intent_id} before resubmitting."
+                    )
+                    self.store.update(job)
+                    logger.error(job.last_local_error)
+                    self._emit("attention", job, message=job.last_local_error)
+                    return None
+            job.batch_id = submitted.batch_id
+            job.endpoint = submitted.endpoint
+            job.provider_status = submitted.provider_status
+            job.state = JobState.PENDING
+            job.last_local_error = None
+            self.store.update(job)
             self._emit("submitted", job)
             return job
 
-        results = await asyncio.gather(*(submit_one(f) for f in files))
+        results = await asyncio.gather(
+            *(submit_one(input_file, job) for input_file, job in intents)
+        )
         return [job for job in results if job is not None]
 
     async def watch(self, jobs: list[JobRecord], output_dir: Path) -> list[JobRecord]:
@@ -93,11 +128,23 @@ class BatchOrchestrator:
         if not jobs:
             self._emit("log", message="No actionable jobs to watch")
             return []
-        return list(
-            await asyncio.gather(*(self._watch_job(job, output_dir) for job in jobs))
-        )
+        semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
+
+        async def watch_one(job: JobRecord) -> JobRecord:
+            async with semaphore:
+                return await self._watch_job(job, output_dir)
+
+        return list(await asyncio.gather(*(watch_one(job) for job in jobs)))
 
     async def _watch_job(self, job: JobRecord, output_dir: Path) -> JobRecord:
+        if job.batch_id is None:
+            job.last_local_error = (
+                f"Submission outcome unknown for intent {job.intent_id}; run "
+                "'batchwizard reconcile' before resubmitting"
+            )
+            self.store.update(job)
+            self._emit("attention", job, message=job.last_local_error)
+            return job
         if job.state in TERMINAL_STATES:
             return await self.collect(job, output_dir)
 
@@ -159,7 +206,10 @@ class BatchOrchestrator:
         job.error_summary = status.error_summary
         job.last_local_error = None
         job.poll_failures = 0
-        if status.is_terminal and job.collection_state != CollectionState.COLLECTED:
+        if status.is_terminal and job.collection_state in {
+            CollectionState.NOT_READY,
+            CollectionState.FAILED,
+        }:
             job.collection_state = CollectionState.PENDING
 
     async def collect(self, job: JobRecord, output_dir: Path) -> JobRecord:
@@ -168,6 +218,14 @@ class BatchOrchestrator:
             raise ValueError(f"Cannot collect non-terminal job {job.batch_id}")
         try:
             results = await self.provider.fetch_results(job.batch_id, output_dir)
+        except ArtifactUnavailableError as e:
+            job.collection_state = CollectionState.UNAVAILABLE
+            job.error_summary = str(e)
+            job.last_local_error = None
+            self.store.update(job)
+            logger.warning(f"Artifacts unavailable for {job.batch_id}: {e}")
+            self._emit("finished", job, message=str(e))
+            return job
         except Exception as e:
             job.collection_state = CollectionState.FAILED
             job.last_local_error = f"Artifact collection failed: {e}"
@@ -179,6 +237,8 @@ class BatchOrchestrator:
         job.output_path = str(results.output_path) if results.output_path else None
         job.error_path = str(results.error_path) if results.error_path else None
         job.collection_state = CollectionState.COLLECTED
+        if results.error_summary:
+            job.error_summary = results.error_summary
         job.last_local_error = None
         self.store.update(job)
         self._emit("finished", job)
@@ -187,7 +247,7 @@ class BatchOrchestrator:
     async def request_cancel(self, batch_id: str) -> BatchStatus:
         """Request cancellation without pretending it has already completed."""
         status = await self.provider.cancel(batch_id)
-        job = self.store.get(batch_id)
+        job = self.store.get(batch_id, provider=self.provider.name)
         if job:
             self._apply_status(job, status)
             self.store.update(job)
@@ -198,7 +258,7 @@ class BatchOrchestrator:
         self,
         input_paths: list[Path],
         output_dir: Path,
-        endpoint: str = "/v1/chat/completions",
+        endpoint: str | None = None,
     ) -> list[JobRecord]:
         """Submit and then watch to completion (the classic blocking flow)."""
         jobs = await self.submit_paths(input_paths, endpoint)
@@ -206,8 +266,10 @@ class BatchOrchestrator:
 
 
 def _is_retryable(error: Exception) -> bool:
-    """Follow common HTTP retry semantics without importing a provider SDK."""
+    """Retry only SDK transport failures and documented transient HTTP statuses."""
+    if isinstance(error, (AnthropicConnectionError, OpenAIConnectionError)):
+        return True
     status_code = getattr(error, "status_code", None)
     if status_code is None:
-        return True
+        return False
     return status_code in {408, 409, 429} or status_code >= 500

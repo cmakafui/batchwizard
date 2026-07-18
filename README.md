@@ -1,248 +1,168 @@
 # BatchWizard
 
-BatchWizard is a durable CLI control plane for asynchronous LLM work. Submit OpenAI Batch API jobs, exit safely, and return later to inspect their remote state and collect their result and error artifacts. Its provider-neutral manifest and orchestration layer are designed to support additional batch providers without flattening their native request formats.
+BatchWizard runs OpenAI and Anthropic batch jobs without requiring a terminal to
+stay open. It records submissions in SQLite, reconnects to active jobs, and
+collects provider-native result files when they finish.
 
-![image](https://github.com/user-attachments/assets/8084afbd-fd05-43b3-b57c-2ea1eb70a457)
+BatchWizard does not translate request bodies between providers. OpenAI inputs
+remain OpenAI Batch JSONL; Anthropic inputs remain Message Batches JSONL.
 
-## Table of Contents
+## Install
 
-- [Installation](#installation)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Commands](#commands)
-- [Features](#features)
-- [Contributing](#contributing)
-- [License](#license)
-
-## Installation
-
-You can install BatchWizard using `pipx` for an isolated environment or directly via `pip`.
-
-### Using pipx (recommended)
+BatchWizard requires Python 3.11 or newer. Install it as an isolated CLI with
+[`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-pipx install batchwizard
+uv tool install batchwizard
+batchwizard --help
 ```
 
-### Using pip
+Upgrade an existing installation with:
 
 ```bash
-pip install batchwizard
+uv tool upgrade batchwizard
 ```
 
-Ensure you have `pipx` or `pip` installed on your system. For `pipx`, you can follow the installation instructions [here](https://pipx.pypa.io/stable/installation/).
+## Configure credentials
 
-## Usage
-
-BatchWizard provides a command-line interface (CLI) for managing batch jobs. Here are some example commands:
-
-### Process Batch Jobs
-
-To process input files or directories:
+BatchWizard reads the standard provider environment variables:
 
 ```bash
-batchwizard process <input_paths>... [--output-directory OUTPUT_DIR] [--max-concurrent-jobs NUM] [--check-interval SECONDS]
+export OPENAI_API_KEY="..."
+export ANTHROPIC_API_KEY="..."
 ```
 
-You can provide multiple input paths, which can be individual JSONL files or directories containing JSONL files.
+Keys can instead be stored in BatchWizard's local configuration file:
 
-#### Example with Sample Input
+```bash
+batchwizard configure --provider openai --set-key "$OPENAI_API_KEY"
+batchwizard configure --provider anthropic --set-key "$ANTHROPIC_API_KEY"
+```
 
-Let's say you have a file named `batchinput.jsonl` with the following content:
+The configuration file is replaced atomically and written with owner-only
+permissions.
+
+## Submit work
+
+### OpenAI
+
+OpenAI uses its native Batch API JSONL envelope:
 
 ```jsonl
-{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "You are a helpful assistant."},{"role": "user", "content": "Hello world!"}],"max_tokens": 1000}}
-{"custom_id": "request-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "You are an unhelpful assistant."},{"role": "user", "content": "Hello world!"}],"max_tokens": 1000}}
+{"custom_id":"ticket-1","method":"POST","url":"/v1/responses","body":{"model":"gpt-5.4","input":"Classify this ticket as billing, technical, or other."}}
 ```
 
-For the Responses API, use `/v1/responses` in both the JSONL request and the
-submission endpoint:
+The endpoint passed to BatchWizard must match the `url` in every input row:
+
+```bash
+batchwizard submit openai.jsonl --endpoint /v1/responses
+```
+
+`/v1/chat/completions` remains the default when `--endpoint` is omitted. Other
+supported endpoints include `/v1/embeddings`, `/v1/completions`,
+`/v1/moderations`, `/v1/images/generations`, `/v1/images/edits`, and
+`/v1/videos`.
+
+### Anthropic
+
+Anthropic uses the native Message Batches format:
 
 ```jsonl
-{"custom_id":"request-1","method":"POST","url":"/v1/responses","body":{"model":"gpt-5.4","input":"Classify this support ticket as billing, technical, or other."}}
+{"custom_id":"ticket-1","params":{"model":"claude-opus-4-8","max_tokens":256,"messages":[{"role":"user","content":"Classify this ticket as billing, technical, or other."}]}}
 ```
 
 ```bash
-batchwizard submit batchinput.jsonl --endpoint /v1/responses
+batchwizard submit --provider anthropic anthropic.jsonl
 ```
 
-To process this file using BatchWizard:
+BatchWizard validates the batch envelope, `custom_id` syntax and uniqueness,
+batch size, `max_tokens`, and the non-streaming requirement. Anthropic remains
+responsible for validating the evolving Messages parameter surface.
 
-1. First, ensure your OpenAI API key is set:
-   ```bash
-   batchwizard configure --set-key YOUR_API_KEY
-   ```
-2. Then, run the process command:
-   ```bash
-   batchwizard process /path/to/batchinput.jsonl --output-directory /path/to/output
-   ```
-   This command will:
-   - Upload the `batchinput.jsonl` file to OpenAI
-   - Create a batch job
-   - Monitor the job status
-   - Download the results to the specified output directory when complete
+See [Anthropic Message Batches](docs/anthropic.md) for lifecycle, cancellation,
+result routing, and retention details.
 
-You can also process multiple files or directories:
+## Watch and collect
+
+`submit` returns after the provider accepts the jobs. A later process can resume
+all outstanding work:
 
 ```bash
-batchwizard process /path/to/file1.jsonl /path/to/directory_with_jsonl_files /path/to/file2.jsonl
+batchwizard watch --output-directory ./results
 ```
 
-### Submit Without Blocking (fire and forget)
+`watch` groups jobs by provider and polls those groups concurrently. A missing
+credential for one provider does not block the other provider's jobs.
 
-`process` blocks until every batch completes — which can take up to 24 hours. To submit and get your terminal back:
+Submission intents are written to the local manifest before network I/O. If a
+connection fails after the provider may have accepted a batch, BatchWizard keeps
+the intent instead of risking a duplicate submission. Inspect and recover those
+rows with `batchwizard reconcile`; OpenAI intents are matched through batch
+metadata, while Anthropic batches can be attached with `--batch-id` after they
+are identified with `list-jobs`.
+
+Remote execution and local artifact collection are tracked separately. A
+completed provider job remains actionable until its files are collected. Failed
+downloads are retried by the next `watch`; artifacts removed after a provider's
+retention window are marked `unavailable` and are not retried forever.
+
+Inspect the local manifest at any time:
 
 ```bash
-batchwizard submit /path/to/inputs/           # or: batchwizard process ... --submit-only
+batchwizard status
+batchwizard status --all
 ```
 
-Submitted jobs are recorded in a local manifest (SQLite, in the BatchWizard config directory). Later—even after a reboot—reattach with:
+By default, `status` shows active jobs and terminal jobs that still need artifact
+collection. `--all` also includes finished jobs.
 
-```bash
-batchwizard watch [--output-directory OUTPUT_DIR]
-```
+## Results
 
-`watch` picks up every actionable job from the manifest. It polls active remote
-jobs and retries artifact collection for terminal jobs whose previous download
-failed.
+Provider output is preserved as JSONL. Anthropic's streamed, unordered rows are
+split without changing their contents:
 
-### Check Tracked Jobs
+- `<batch_id>_results.jsonl` contains `succeeded` rows.
+- `<batch_id>_errors.jsonl` contains `errored`, `expired`, and `canceled` rows.
 
-```bash
-batchwizard status [--all]
-```
-
-Shows actionable jobs from the local manifest (`--all` includes fully collected
-ones). Remote lifecycle, request outcomes, local collection state, and local
-connectivity errors are reported separately.
-
-### Durable Job Lifecycle
-
-BatchWizard never marks a provider batch as failed merely because the local
-machine lost contact with it. It also does not treat provider completion as proof
-that result files were collected successfully. Failed downloads remain actionable
-and are retried on the next `watch`.
-
-See [Job lifecycle](docs/job-lifecycle.md) for the state model, recovery invariants,
-provider contract, and manifest migration behavior.
-
-### Failure Reasons and Error Files
-
-When a batch fails, BatchWizard surfaces the provider's actual error (e.g. `insufficient_funds`, `invalid_request` with the offending line). When individual requests inside a batch fail, the per-request error file is downloaded alongside the results as `<batch_id>_errors.jsonl`.
-
-### Batch Endpoints
-
-By default requests go to `/v1/chat/completions` for backward compatibility. Use
-`--endpoint` on `process`/`submit` for `/v1/responses`, `/v1/embeddings`,
-`/v1/completions`, `/v1/moderations`, `/v1/images/generations`,
-`/v1/images/edits`, or `/v1/videos`. Every line's `url` must match the selected
-batch endpoint.
-
-### List Recent Jobs
-
-To list recent batch jobs from the provider:
-
-```bash
-batchwizard list-jobs [--limit NUM]
-```
-
-### Cancel a Job
-
-To cancel a specific batch job:
-
-```bash
-batchwizard cancel <job_id>
-```
-
-### Download Job Results
-
-To download results for a completed batch job:
-
-```bash
-batchwizard download <job_id> [--output-directory OUTPUT_DIR]
-```
-
-This downloads the results file and, if any requests failed, the per-request error file.
-
-## Configuration
-
-### Setting up the OpenAI API Key
-
-To set the OpenAI API key:
-
-```bash
-batchwizard configure --set-key YOUR_API_KEY
-```
-
-### Show Current Configuration
-
-To show the current configuration:
-
-```bash
-batchwizard configure --show
-```
-
-### Reset Configuration
-
-To reset the configuration to default values:
-
-```bash
-batchwizard configure --reset
-```
+Files are written through temporary files and renamed only after the result
+stream completes, so an interrupted download does not expose a partial final
+file.
 
 ## Commands
 
-BatchWizard supports the following commands:
+| Command | Purpose |
+| --- | --- |
+| `submit` | Submit files and return immediately. |
+| `watch` | Resume actionable jobs and collect terminal artifacts. |
+| `process` | Submit, wait, and collect in one invocation. |
+| `status` | Inspect jobs in the local SQLite manifest. |
+| `reconcile` | Recover a submission whose provider outcome was uncertain. |
+| `list-jobs` | List recent jobs directly from one provider. |
+| `cancel` | Request cancellation; provider inference works for tracked jobs. |
+| `download` | Collect one batch's result artifacts. |
+| `configure` | Store, inspect, or reset local configuration. |
 
-- `process`: Submit batch jobs and wait for completion (add `--submit-only` to return immediately).
-- `submit`: Submit batch jobs and exit; jobs are tracked in the local manifest.
-- `watch`: Advance active jobs and retry uncollected terminal artifacts.
-- `status`: Show jobs tracked in the local manifest.
-- `configure`: Manage BatchWizard configuration.
-- `list-jobs`: List recent batch jobs from the provider.
-- `cancel`: Cancel a specific batch job.
-- `download`: Download results (and error file) for a batch job.
+Use `batchwizard <command> --help` for command-specific options.
 
-For detailed information on each command, use the `--help` option:
+## Development
 
-```bash
-batchwizard <command> --help
-```
-
-## Features
-
-- **Flexible Input**: Process individual JSONL files or entire directories containing JSONL files.
-- **Asynchronous Processing**: Efficiently handle multiple batch jobs concurrently.
-- **Rich UI**: Display progress and job status using a rich, interactive interface.
-- **Flexible Configuration**: Easily manage API keys and other settings.
-- **Job Management**: List, cancel, and download results for batch jobs.
-- **Durable Recovery**: Preserve remote truth across local connectivity and artifact-download failures.
-- **Responses API**: Submit modern `/v1/responses` JSONL batches alongside other OpenAI batch endpoints.
-
-## Contributing
-
-We welcome contributions to BatchWizard! To contribute, follow these steps:
-
-1. Fork the repository.
-2. Create a new branch: `git checkout -b feature/your-feature-name`.
-3. Make your changes and commit them: `git commit -m 'Add some feature'`.
-4. Push to the branch: `git push origin feature/your-feature-name`.
-5. Open a pull request.
-
-### Running Tests
-
-To run tests, use `pytest`:
+Create the project environment and run commands through `uv`:
 
 ```bash
-uv run pytest tests/
+uv sync --all-groups
+uv run batchwizard --help
+uv run pytest
+uv run ruff format --check .
+uv run ruff check .
+uv build
 ```
 
-Ensure your code passes all tests and meets the coding standards before opening a pull request.
+The supported runtime matrix is Python 3.11 through 3.14. The dependency lockfile
+is committed; update it intentionally with `uv lock --upgrade-package <package>`.
+
+The provider contract, recovery invariants, and manifest migrations are described
+in [Job lifecycle](docs/job-lifecycle.md).
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Contact
-
-For any questions or feedback, feel free to open an issue on the [GitHub repository](https://github.com/cmakafui/batchwizard).
+[MIT](LICENSE)

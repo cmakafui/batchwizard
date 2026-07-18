@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from loguru import logger
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAioHttpClient, NotFoundError
 
 from ..config import config
 from ..models import (
@@ -14,7 +15,11 @@ from ..models import (
     DownloadedResults,
     JobState,
     ProviderJobSummary,
+    SubmittedBatch,
 )
+from .base import ArtifactUnavailableError
+
+DEFAULT_ENDPOINT = "/v1/chat/completions"
 
 SUPPORTED_ENDPOINTS = frozenset(
     {
@@ -61,9 +66,19 @@ class OpenAIBatchProvider:
     name = "openai"
 
     def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(api_key=config.get_api_key())
+        self.client = client or AsyncOpenAI(
+            api_key=config.get_api_key("openai"),
+            http_client=DefaultAioHttpClient(),
+            max_retries=0,
+        )
 
-    async def submit(self, input_file: Path, endpoint: str) -> str:
+    async def submit(
+        self,
+        input_file: Path,
+        endpoint: str | None = None,
+        intent_id: str | None = None,
+    ) -> SubmittedBatch:
+        endpoint = endpoint or DEFAULT_ENDPOINT
         if endpoint not in SUPPORTED_ENDPOINTS:
             available = ", ".join(sorted(SUPPORTED_ENDPOINTS))
             raise ValueError(
@@ -71,13 +86,20 @@ class OpenAIBatchProvider:
                 f"Available: {available}"
             )
         uploaded = await self.client.files.create(file=input_file, purpose="batch")
-        batch = await self.client.batches.create(
+        create_options = dict(
             input_file_id=uploaded.id,
             endpoint=endpoint,
             completion_window="24h",
         )
+        if intent_id is not None:
+            create_options["metadata"] = {"batchwizard_intent": intent_id}
+        batch = await self.client.batches.create(**create_options)
         logger.info(f"Submitted {input_file.name} as batch {batch.id}")
-        return batch.id
+        return SubmittedBatch(
+            batch_id=batch.id,
+            provider_status=str(batch.status).lower(),
+            endpoint=endpoint,
+        )
 
     async def status(self, batch_id: str) -> BatchStatus:
         batch = await self.client.batches.retrieve(batch_id)
@@ -94,7 +116,12 @@ class OpenAIBatchProvider:
             if not file_id:
                 continue
             path = output_dir / f"{batch_id}_{suffix}.jsonl"
-            await self._download_atomic(file_id, path)
+            try:
+                await self._download_atomic(file_id, path)
+            except NotFoundError as error:
+                raise ArtifactUnavailableError(
+                    f"OpenAI results for {batch_id} are no longer available"
+                ) from error
             setattr(results, attr, path)
             logger.info(f"Downloaded {suffix} for {batch_id} to {path}")
         return results
@@ -123,20 +150,31 @@ class OpenAIBatchProvider:
         return _normalize_status(batch)
 
     async def list_jobs(self, limit: int = 20) -> list[ProviderJobSummary]:
-        page = await self.client.batches.list(limit=limit)
+        if limit < 1:
+            return []
+        page = await self.client.batches.list(limit=min(limit, 100))
         jobs = []
-        for batch in page.data:
+        async for batch in page:
             counts = getattr(batch, "request_counts", None)
+            metadata = getattr(batch, "metadata", None) or {}
             jobs.append(
                 ProviderJobSummary(
                     batch_id=batch.id,
                     provider_status=batch.status,
-                    created_at=getattr(batch, "created_at", None),
+                    endpoint=getattr(batch, "endpoint", None),
+                    intent_id=metadata.get("batchwizard_intent"),
+                    created_at=(
+                        datetime.fromtimestamp(batch.created_at, UTC)
+                        if getattr(batch, "created_at", None) is not None
+                        else None
+                    ),
                     completed_count=getattr(counts, "completed", 0) or 0,
                     failed_count=getattr(counts, "failed", 0) or 0,
                     total_count=getattr(counts, "total", 0) or 0,
                 )
             )
+            if len(jobs) >= limit:
+                break
         return jobs
 
     async def close(self) -> None:

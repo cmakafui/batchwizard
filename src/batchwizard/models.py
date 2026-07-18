@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +17,7 @@ class JobState(StrEnum):
     forcing BatchWizard to guess what an unknown status means.
     """
 
+    SUBMITTING = "submitting"
     PENDING = "pending"
     RUNNING = "running"
     CANCELLING = "cancelling"
@@ -27,6 +29,7 @@ class JobState(StrEnum):
 
 ACTIVE_STATES = frozenset(
     {
+        JobState.SUBMITTING,
         JobState.PENDING,
         JobState.RUNNING,
         JobState.CANCELLING,
@@ -50,6 +53,7 @@ class CollectionState(StrEnum):
     PENDING = "pending"
     COLLECTED = "collected"
     FAILED = "failed"
+    UNAVAILABLE = "unavailable"
 
 
 ACTIONABLE_COLLECTION_STATES = frozenset(
@@ -69,9 +73,10 @@ class JobRecord(BaseModel):
 
     id: int | None = None
     provider: str = "openai"
-    batch_id: str
+    intent_id: str = Field(default_factory=lambda: uuid4().hex)
+    batch_id: str | None = None
     input_path: str
-    endpoint: str = "/v1/chat/completions"
+    endpoint: str | None = None
     state: JobState = JobState.PENDING
     provider_status: str = ""
     collection_state: CollectionState = CollectionState.NOT_READY
@@ -94,6 +99,11 @@ class JobRecord(BaseModel):
             self.state in TERMINAL_STATES
             and self.collection_state in ACTIONABLE_COLLECTION_STATES
         )
+
+    @property
+    def reference(self) -> str:
+        """Provider ID when known, otherwise the durable submission intent."""
+        return self.batch_id or f"intent:{self.intent_id}"
 
 
 class BatchStatus(BaseModel):
@@ -121,12 +131,25 @@ class ProviderJobSummary(BaseModel):
 
     batch_id: str
     provider_status: str
-    created_at: int | None = None
+    endpoint: str | None = None
+    intent_id: str | None = None
+    created_at: datetime | None = None
     completed_count: int = 0
     failed_count: int = 0
+    cancelled_count: int = 0
+    expired_count: int = 0
     total_count: int = 0
+
+
+class SubmittedBatch(BaseModel):
+    """Provider submission result persisted in the local manifest."""
+
+    batch_id: str
+    provider_status: str
+    endpoint: str | None = None
 
 
 class DownloadedResults(BaseModel):
     output_path: Path | None = None
     error_path: Path | None = None
+    error_summary: str | None = None

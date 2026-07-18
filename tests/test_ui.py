@@ -18,4 +18,4 @@ def test_dashboard_renders_local_attention_separately_from_remote_state():
 
     assert rendered is not None
     assert "needs attention" in "\n".join(dashboard.logs)
-    assert dashboard.jobs[job.batch_id].is_actionable
+    assert dashboard.jobs[(job.provider, job.batch_id)].is_actionable

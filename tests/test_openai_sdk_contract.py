@@ -24,6 +24,7 @@ def _batch(status: str, batch_id: str = "batch_1") -> dict:
         "completion_window": "24h",
         "status": status,
         "created_at": 1_714_508_499,
+        "metadata": {"batchwizard_intent": "intent-sdk-contract"},
         "request_counts": {"completed": 0, "failed": 0, "total": 1},
     }
 
@@ -51,6 +52,17 @@ async def test_real_sdk_supports_responses_and_preserves_future_status(
             )
         if request.method == "POST" and request.url.path == "/v1/batches":
             return httpx.Response(200, json=_batch("validating", "batch_new"))
+        if request.method == "GET" and request.url.path == "/v1/batches":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [_batch("validating", "batch_new")],
+                    "first_id": "batch_new",
+                    "last_id": "batch_new",
+                    "has_more": False,
+                },
+            )
         if request.method == "GET" and request.url.path == "/v1/batches/batch_new":
             return httpx.Response(
                 200, json=_batch("future_provider_state", "batch_new")
@@ -73,8 +85,11 @@ async def test_real_sdk_supports_responses_and_preserves_future_status(
     )
 
     try:
-        batch_id = await provider.submit(input_file, "/v1/responses")
-        status = await provider.status(batch_id)
+        submitted = await provider.submit(
+            input_file, "/v1/responses", intent_id="intent-sdk-contract"
+        )
+        status = await provider.status(submitted.batch_id)
+        listed = await provider.list_jobs(limit=1)
     finally:
         await provider.close()
 
@@ -85,11 +100,13 @@ async def test_real_sdk_supports_responses_and_preserves_future_status(
         "completion_window": "24h",
         "endpoint": "/v1/responses",
         "input_file_id": "file_in_1",
+        "metadata": {"batchwizard_intent": "intent-sdk-contract"},
     }
     upload_request = next(
         body for method, path, body in requests if path == "/v1/files"
     )
     assert b'filename="input.jsonl"' in upload_request
     assert b'"url":"/v1/responses"' in upload_request
+    assert listed[0].intent_id == "intent-sdk-contract"
     assert status.provider_status == "future_provider_state"
     assert status.state is None

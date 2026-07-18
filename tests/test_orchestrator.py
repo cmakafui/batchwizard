@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+
+import httpx
+from openai import APIConnectionError
 
 from batchwizard.models import (
     BatchStatus,
     CollectionState,
     DownloadedResults,
     JobState,
+    SubmittedBatch,
 )
 from batchwizard.processor import BatchOrchestrator
+from batchwizard.providers.base import ArtifactUnavailableError
 from batchwizard.store import JobStore
 from batchwizard.utils import discover_jsonl
 
@@ -22,19 +28,31 @@ class FakeProvider:
         self.counter = 0
         self.status_scripts: dict[str, list[BatchStatus]] = {}
         self.files: dict[str, DownloadedResults] = {}
-        self.submitted: list[tuple[Path, str]] = []
+        self.submitted: list[tuple[Path, str | None]] = []
         self.fail_submit_for: set[str] = set()
+        self.reject_submit_for: set[str] = set()
         self.fetch_failures: dict[str, int] = {}
         self.cancel_status = BatchStatus(
             provider_status="cancelling", state=JobState.CANCELLING
         )
 
-    async def submit(self, input_file: Path, endpoint: str) -> str:
+    async def submit(
+        self,
+        input_file: Path,
+        endpoint: str | None = None,
+        intent_id: str | None = None,
+    ) -> SubmittedBatch:
+        if input_file.name in self.reject_submit_for:
+            raise ValueError("input rejected locally")
         if input_file.name in self.fail_submit_for:
             raise RuntimeError("upload exploded")
         self.submitted.append((input_file, endpoint))
         self.counter += 1
-        return f"batch_{self.counter}"
+        return SubmittedBatch(
+            batch_id=f"batch_{self.counter}",
+            provider_status="validating",
+            endpoint=endpoint or "/v1/chat/completions",
+        )
 
     async def status(self, batch_id: str) -> BatchStatus:
         script = self.status_scripts[batch_id]
@@ -95,15 +113,53 @@ async def test_submit_records_jobs_in_manifest(store: JobStore, jsonl_dir: Path)
     assert all(j.endpoint == "/v1/responses" for j in pending)
 
 
-async def test_submit_failure_skips_manifest(store: JobStore, jsonl_dir: Path):
+async def test_uncertain_submit_failure_preserves_reconcilable_intent(
+    store: JobStore, jsonl_dir: Path
+):
     provider = FakeProvider()
     provider.fail_submit_for = {"a.jsonl"}
     orchestrator = BatchOrchestrator(provider, store)
 
     jobs = await orchestrator.submit_paths([jsonl_dir])
 
-    assert len(jobs) == 1  # only b.jsonl made it
-    assert len(store.pending()) == 1
+    assert len(jobs) == 1
+    unresolved = store.unresolved()
+    assert len(unresolved) == 1
+    assert unresolved[0].state == JobState.SUBMITTING
+    assert unresolved[0].batch_id is None
+    assert "outcome unknown" in unresolved[0].last_local_error
+    assert unresolved[0].is_actionable
+
+
+async def test_local_submit_rejection_removes_intent(store: JobStore, jsonl_dir: Path):
+    provider = FakeProvider()
+    provider.reject_submit_for = {"a.jsonl"}
+
+    jobs = await BatchOrchestrator(provider, store).submit_paths(
+        [jsonl_dir / "a.jsonl"]
+    )
+
+    assert jobs == []
+    assert store.list() == []
+
+
+async def test_submission_intent_exists_before_provider_call(
+    store: JobStore, jsonl_dir: Path
+):
+    class InspectingProvider(FakeProvider):
+        async def submit(self, input_file, endpoint=None, intent_id=None):
+            intent = store.get_intent(intent_id)
+            assert intent is not None
+            assert intent.state == JobState.SUBMITTING
+            assert intent.batch_id is None
+            return await super().submit(input_file, endpoint, intent_id)
+
+    jobs = await BatchOrchestrator(InspectingProvider(), store).submit_paths(
+        [jsonl_dir / "a.jsonl"]
+    )
+
+    assert jobs[0].state == JobState.PENDING
+    assert jobs[0].batch_id == "batch_1"
 
 
 async def test_watch_polls_to_completion_and_downloads(
@@ -169,7 +225,10 @@ async def test_watch_pauses_after_repeated_poll_failures_without_rewriting_remot
 ):
     class DeadProvider(FakeProvider):
         async def status(self, batch_id: str) -> BatchStatus:
-            raise ConnectionError("network down")
+            raise APIConnectionError(
+                message="network down",
+                request=httpx.Request("GET", "https://api.openai.test/v1/batches/x"),
+            )
 
     provider = DeadProvider()
     orchestrator = BatchOrchestrator(provider, store, check_interval=0)
@@ -186,6 +245,23 @@ async def test_watch_pauses_after_repeated_poll_failures_without_rewriting_remot
     retried = await orchestrator.watch(store.actionable(), tmp_path / "out")
     assert retried[0].poll_failures == 10
     assert retried[0].state == JobState.PENDING
+
+
+async def test_programming_error_in_status_fails_fast(
+    store: JobStore, jsonl_dir: Path, tmp_path: Path
+):
+    class BrokenProvider(FakeProvider):
+        async def status(self, batch_id: str) -> BatchStatus:
+            raise TypeError("bad response shape")
+
+    provider = BrokenProvider()
+    orchestrator = BatchOrchestrator(provider, store, check_interval=0)
+    jobs = await orchestrator.submit_paths([jsonl_dir / "a.jsonl"])
+
+    paused = (await orchestrator.watch(jobs, tmp_path / "out"))[0]
+
+    assert paused.poll_failures == 1
+    assert "bad response shape" in paused.last_local_error
 
 
 async def test_non_retryable_poll_failure_pauses_immediately_without_remote_failure(
@@ -306,6 +382,31 @@ async def test_terminal_job_with_no_provider_files_is_still_fully_collected(
     assert not finished.is_actionable
 
 
+async def test_permanently_unavailable_artifacts_do_not_retry_forever(
+    store: JobStore, jsonl_dir: Path, tmp_path: Path
+):
+    class ArchivedProvider(FakeProvider):
+        async def fetch_results(self, batch_id, output_dir):
+            raise ArtifactUnavailableError("provider retention window elapsed")
+
+    provider = ArchivedProvider()
+    provider.status_scripts = {"batch_1": [done()]}
+    orchestrator = BatchOrchestrator(provider, store, check_interval=0)
+    jobs = await orchestrator.submit_paths([jsonl_dir / "a.jsonl"])
+
+    finished = (await orchestrator.watch(jobs, tmp_path / "out"))[0]
+
+    assert finished.state == JobState.COMPLETED
+    assert finished.collection_state == CollectionState.UNAVAILABLE
+    assert finished.error_summary == "provider retention window elapsed"
+    assert not finished.is_actionable
+    assert store.actionable() == []
+
+    # A later status refresh must not turn permanent retention loss retryable again.
+    orchestrator._apply_status(finished, done())
+    assert finished.collection_state == CollectionState.UNAVAILABLE
+
+
 async def test_events_are_emitted_in_order(store: JobStore, jsonl_dir: Path, tmp_path):
     provider = FakeProvider()
     provider.status_scripts = {"batch_1": [running(1), done()]}
@@ -318,3 +419,35 @@ async def test_events_are_emitted_in_order(store: JobStore, jsonl_dir: Path, tmp
     assert events[0] == "submitted"
     assert events[-1] == "finished"
     assert "status" in events
+
+
+async def test_watch_bounds_concurrent_jobs(
+    store: JobStore, jsonl_dir: Path, tmp_path: Path
+):
+    class MeasuringProvider(FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.active = 0
+            self.high_water = 0
+
+        async def status(self, batch_id: str) -> BatchStatus:
+            self.active += 1
+            self.high_water = max(self.high_water, self.active)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return done()
+
+    provider = MeasuringProvider()
+    orchestrator = BatchOrchestrator(
+        provider, store, check_interval=0, max_concurrent_jobs=2
+    )
+    jobs = await orchestrator.submit_paths([jsonl_dir])
+    extra_a = jsonl_dir / "c.jsonl"
+    extra_b = jsonl_dir / "d.jsonl"
+    extra_a.write_text("{}\n")
+    extra_b.write_text("{}\n")
+    jobs.extend(await orchestrator.submit_paths([extra_a, extra_b]))
+
+    await orchestrator.watch(jobs, tmp_path / "out")
+
+    assert provider.high_water == 2

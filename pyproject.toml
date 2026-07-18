@@ -1,12 +1,12 @@
 [project]
 name = "batchwizard"
 dynamic = ["version"]
-description = "BatchWizard: Manage OpenAI batch processing jobs with ease"
+description = "Durable batch orchestration across OpenAI and Anthropic"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Carl Kugblenu" }]
 requires-python = ">=3.11"
-keywords = ["openai", "batch", "cli", "async"]
+keywords = ["openai", "anthropic", "batch", "cli", "async"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -20,7 +20,8 @@ classifiers = [
 dependencies = [
     "typer>=0.12",
     "rich>=13.7",
-    "openai>=2.46,<3",
+    "openai[aiohttp]>=2.46,<3",
+    "anthropic[aiohttp]>=0.117,<1",
     "pydantic>=2.8",
     "pydantic-settings>=2.3",
     "loguru>=0.7",

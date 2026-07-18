@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import pytest
+from openai import NotFoundError
+
+import batchwizard.providers.openai as openai_provider
 from batchwizard.models import JobState
+from batchwizard.providers.base import ArtifactUnavailableError
 from batchwizard.providers.openai import OpenAIBatchProvider
 
 
@@ -35,6 +41,12 @@ class StubStreamingFiles:
         self.client = client
 
     def content(self, file_id):
+        if file_id in self.client.not_found_for:
+            request = httpx.Request(
+                "GET", f"https://api.openai.test/v1/files/{file_id}/content"
+            )
+            response = httpx.Response(404, request=request)
+            raise NotFoundError("deleted", response=response, body=None)
         return StubStreamContext(
             StubStreamResponse(
                 self.client._file_contents[file_id],
@@ -63,6 +75,8 @@ class StubClient:
         self.created_batches = []
         self.uploaded_files = []
         self.fail_stream_for = set()
+        self.not_found_for = set()
+        self.list_items = [self._batch]
 
     def add_file(self, file_id: str, content: bytes):
         self._file_contents[file_id] = content
@@ -76,7 +90,7 @@ class StubClient:
 
     async def _batch_create(self, **kwargs):
         self.created_batches.append(kwargs)
-        return SimpleNamespace(id="batch_new")
+        return SimpleNamespace(id="batch_new", status="validating")
 
     async def _batch_retrieve(self, batch_id):
         return self._batch
@@ -85,9 +99,19 @@ class StubClient:
         return make_batch(id=batch_id, status="cancelling")
 
     async def _batch_list(self, limit):
-        return SimpleNamespace(data=[self._batch])
+        return StubPage(self.list_items, first_page_size=1)
 
     async def close(self): ...
+
+
+class StubPage:
+    def __init__(self, items, first_page_size: int | None = None):
+        self.items = items
+        self.data = items[:first_page_size]
+
+    async def __aiter__(self):
+        for item in self.items:
+            yield item
 
 
 def make_batch(**overrides):
@@ -104,6 +128,30 @@ def make_batch(**overrides):
     return SimpleNamespace(**defaults)
 
 
+def test_default_client_uses_aiohttp_without_hidden_sdk_retries(monkeypatch):
+    transport = object()
+    captured = {}
+    client = StubClient(make_batch())
+    monkeypatch.setattr(openai_provider, "DefaultAioHttpClient", lambda: transport)
+
+    def make_client(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", make_client)
+    monkeypatch.setattr(
+        openai_provider,
+        "config",
+        SimpleNamespace(get_api_key=lambda name: "key"),
+    )
+
+    provider = OpenAIBatchProvider()
+
+    assert provider.client is client
+    assert captured["http_client"] is transport
+    assert captured["max_retries"] == 0
+
+
 async def test_submit_uploads_and_creates_batch(tmp_path: Path):
     client = StubClient(make_batch())
     provider = OpenAIBatchProvider(client=client)
@@ -113,9 +161,11 @@ async def test_submit_uploads_and_creates_batch(tmp_path: Path):
         '"body":{"model":"gpt-5.4","input":"hello"}}\n'
     )
 
-    batch_id = await provider.submit(input_file, "/v1/responses")
+    submitted = await provider.submit(input_file, "/v1/responses")
 
-    assert batch_id == "batch_new"
+    assert submitted.batch_id == "batch_new"
+    assert submitted.provider_status == "validating"
+    assert submitted.endpoint == "/v1/responses"
     assert client.uploaded_files == [(input_file, "batch")]
     assert client.created_batches == [
         {
@@ -124,6 +174,17 @@ async def test_submit_uploads_and_creates_batch(tmp_path: Path):
             "completion_window": "24h",
         }
     ]
+
+
+async def test_submit_correlates_openai_batch_with_durable_intent(tmp_path: Path):
+    client = StubClient(make_batch())
+    provider = OpenAIBatchProvider(client=client)
+    input_file = tmp_path / "in.jsonl"
+    input_file.write_text("{}\n")
+
+    await provider.submit(input_file, intent_id="intent-123")
+
+    assert client.created_batches[0]["metadata"] == {"batchwizard_intent": "intent-123"}
 
 
 async def test_status_maps_active_states():
@@ -215,12 +276,21 @@ async def test_interrupted_download_is_not_exposed_as_final_file(tmp_path: Path)
     client.fail_stream_for.add("file_out")
     provider = OpenAIBatchProvider(client=client)
 
-    import pytest
-
     with pytest.raises(ConnectionError, match="stream interrupted"):
         await provider.fetch_results("batch_1", tmp_path / "out")
 
     assert not (tmp_path / "out" / "batch_1_results.jsonl").exists()
+    assert list((tmp_path / "out").glob("*.part")) == []
+
+
+async def test_deleted_openai_artifact_is_permanently_unavailable(tmp_path: Path):
+    client = StubClient(make_batch(status="completed", output_file_id="file_gone"))
+    client.not_found_for.add("file_gone")
+    provider = OpenAIBatchProvider(client=client)
+
+    with pytest.raises(ArtifactUnavailableError, match="no longer available"):
+        await provider.fetch_results("batch_1", tmp_path / "out")
+
     assert list((tmp_path / "out").glob("*.part")) == []
 
 
@@ -245,6 +315,16 @@ async def test_list_jobs_returns_provider_neutral_summaries():
     assert jobs[0].batch_id == "batch_1"
     assert jobs[0].provider_status == "completed"
     assert jobs[0].completed_count == 3
+
+
+async def test_list_jobs_iterates_beyond_first_sdk_page():
+    client = StubClient(make_batch())
+    client.list_items = [make_batch(id=f"batch_{index}") for index in range(3)]
+    provider = OpenAIBatchProvider(client=client)
+
+    jobs = await provider.list_jobs(limit=3)
+
+    assert [job.batch_id for job in jobs] == ["batch_0", "batch_1", "batch_2"]
 
 
 async def test_invalid_endpoint_fails_before_upload(tmp_path: Path):
