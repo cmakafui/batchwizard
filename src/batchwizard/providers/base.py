@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from ..models import BatchStatus, DownloadedResults
+from ..models import BatchStatus, DownloadedResults, ProviderJobSummary
 
 
 @runtime_checkable
@@ -22,9 +22,15 @@ class BatchProvider(Protocol):
         ...
 
     async def fetch_results(self, batch_id: str, output_dir: Path) -> DownloadedResults:
-        """Download whatever the batch produced: results and/or per-request errors."""
+        """Idempotently collect available results and per-request errors."""
         ...
 
-    async def cancel(self, batch_id: str) -> None: ...
+    async def cancel(self, batch_id: str) -> BatchStatus:
+        """Request cancellation and return the provider's immediate status."""
+        ...
+
+    async def list_jobs(self, limit: int = 20) -> list[ProviderJobSummary]:
+        """List recent jobs without leaking a provider SDK through the CLI."""
+        ...
 
     async def close(self) -> None: ...

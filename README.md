@@ -1,6 +1,6 @@
 # BatchWizard
 
-BatchWizard is a powerful CLI tool for managing OpenAI batch processing jobs with ease. It provides functionalities to upload files, create batch jobs, check their status, and download the results. The tool uses asynchronous processing to efficiently handle multiple jobs concurrently.
+BatchWizard is a durable CLI control plane for asynchronous LLM work. Submit OpenAI Batch API jobs, exit safely, and return later to inspect their remote state and collect their result and error artifacts. Its provider-neutral manifest and orchestration layer are designed to support additional batch providers without flattening their native request formats.
 
 ![image](https://github.com/user-attachments/assets/8084afbd-fd05-43b3-b57c-2ea1eb70a457)
 
@@ -55,6 +55,17 @@ Let's say you have a file named `batchinput.jsonl` with the following content:
 {"custom_id": "request-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "You are an unhelpful assistant."},{"role": "user", "content": "Hello world!"}],"max_tokens": 1000}}
 ```
 
+For the Responses API, use `/v1/responses` in both the JSONL request and the
+submission endpoint:
+
+```jsonl
+{"custom_id":"request-1","method":"POST","url":"/v1/responses","body":{"model":"gpt-5.4","input":"Classify this support ticket as billing, technical, or other."}}
+```
+
+```bash
+batchwizard submit batchinput.jsonl --endpoint /v1/responses
+```
+
 To process this file using BatchWizard:
 
 1. First, ensure your OpenAI API key is set:
@@ -85,13 +96,15 @@ batchwizard process /path/to/file1.jsonl /path/to/directory_with_jsonl_files /pa
 batchwizard submit /path/to/inputs/           # or: batchwizard process ... --submit-only
 ```
 
-Submitted jobs are recorded in a local manifest (SQLite, in the BatchWizard config directory). Later — even after a reboot — reattach with:
+Submitted jobs are recorded in a local manifest (SQLite, in the BatchWizard config directory). Later—even after a reboot—reattach with:
 
 ```bash
 batchwizard watch [--output-directory OUTPUT_DIR]
 ```
 
-`watch` picks up every pending job from the manifest, polls until completion, and downloads the results.
+`watch` picks up every actionable job from the manifest. It polls active remote
+jobs and retries artifact collection for terminal jobs whose previous download
+failed.
 
 ### Check Tracked Jobs
 
@@ -99,7 +112,19 @@ batchwizard watch [--output-directory OUTPUT_DIR]
 batchwizard status [--all]
 ```
 
-Shows pending jobs from the local manifest (`--all` includes finished ones), with any failure reasons.
+Shows actionable jobs from the local manifest (`--all` includes fully collected
+ones). Remote lifecycle, request outcomes, local collection state, and local
+connectivity errors are reported separately.
+
+### Durable Job Lifecycle
+
+BatchWizard never marks a provider batch as failed merely because the local
+machine lost contact with it. It also does not treat provider completion as proof
+that result files were collected successfully. Failed downloads remain actionable
+and are retried on the next `watch`.
+
+See [Job lifecycle](docs/job-lifecycle.md) for the state model, recovery invariants,
+provider contract, and manifest migration behavior.
 
 ### Failure Reasons and Error Files
 
@@ -107,7 +132,11 @@ When a batch fails, BatchWizard surfaces the provider's actual error (e.g. `insu
 
 ### Batch Endpoints
 
-By default requests go to `/v1/chat/completions`. Use `--endpoint` on `process`/`submit` for other batch-capable endpoints such as `/v1/responses` or `/v1/embeddings`.
+By default requests go to `/v1/chat/completions` for backward compatibility. Use
+`--endpoint` on `process`/`submit` for `/v1/responses`, `/v1/embeddings`,
+`/v1/completions`, `/v1/moderations`, `/v1/images/generations`,
+`/v1/images/edits`, or `/v1/videos`. Every line's `url` must match the selected
+batch endpoint.
 
 ### List Recent Jobs
 
@@ -167,7 +196,7 @@ BatchWizard supports the following commands:
 
 - `process`: Submit batch jobs and wait for completion (add `--submit-only` to return immediately).
 - `submit`: Submit batch jobs and exit; jobs are tracked in the local manifest.
-- `watch`: Reattach to pending jobs, poll, and download results.
+- `watch`: Advance active jobs and retry uncollected terminal artifacts.
 - `status`: Show jobs tracked in the local manifest.
 - `configure`: Manage BatchWizard configuration.
 - `list-jobs`: List recent batch jobs from the provider.
@@ -187,7 +216,8 @@ batchwizard <command> --help
 - **Rich UI**: Display progress and job status using a rich, interactive interface.
 - **Flexible Configuration**: Easily manage API keys and other settings.
 - **Job Management**: List, cancel, and download results for batch jobs.
-- **Error Handling**: Robust error handling and informative error messages.
+- **Durable Recovery**: Preserve remote truth across local connectivity and artifact-download failures.
+- **Responses API**: Submit modern `/v1/responses` JSONL batches alongside other OpenAI batch endpoints.
 
 ## Contributing
 

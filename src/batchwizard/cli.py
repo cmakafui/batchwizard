@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import BatchWizardSettings, config
-from .models import JobState
+from .models import TERMINAL_STATES, CollectionState
 from .processor import BatchOrchestrator
 from .providers import get_provider
 from .store import JobStore
@@ -150,18 +150,18 @@ def watch(
         5, help="Initial interval (in seconds) between job status checks"
     ),
 ):
-    """Reattach to all pending jobs in the manifest; poll and download results."""
+    """Advance remote jobs and retry any uncollected terminal artifacts."""
     _require_api_key()
     output_dir = _default_output_dir(output_directory)
-    provider = get_provider()
     store = JobStore(config.db_file)
-    pending = store.pending()
-    if not pending:
-        console.print("[yellow]No pending jobs in the manifest.[/yellow]")
+    actionable = store.actionable()
+    if not actionable:
+        console.print("[yellow]No actionable jobs in the manifest.[/yellow]")
         return
+    provider = get_provider()
 
     dashboard = Dashboard(Console(), title="BatchWizard Watch")
-    for job in pending:  # seed the table before polling starts
+    for job in actionable:  # seed the table before polling starts
         dashboard.jobs[job.batch_id] = job
 
     async def run():
@@ -170,7 +170,7 @@ def watch(
         )
         try:
             with dashboard:
-                await orchestrator.watch(pending, output_dir)
+                await orchestrator.watch(actionable, output_dir)
         finally:
             await provider.close()
 
@@ -181,30 +181,38 @@ def watch(
 @app.command()
 def status(
     all: bool = typer.Option(
-        False, "--all", help="Show finished jobs too (default: pending only)"
+        False, "--all", help="Show all jobs (default: actionable jobs only)"
     ),
 ):
     """Show jobs tracked in the local manifest."""
     store = JobStore(config.db_file)
-    jobs = store.list() if all else store.pending()
+    jobs = store.list() if all else store.actionable()
     if not jobs:
         console.print("[yellow]No jobs in the manifest.[/yellow]")
         return
     table = Table(title="Tracked Batch Jobs")
+    table.add_column("Provider", style="blue")
     table.add_column("Batch ID", style="cyan")
-    table.add_column("State", style="magenta")
-    table.add_column("Provider Status")
+    table.add_column("Remote", style="magenta")
+    table.add_column("Artifacts")
+    table.add_column("Requests", justify="right")
     table.add_column("Input", style="green")
     table.add_column("Updated", style="dim")
     table.add_column("Detail", style="red")
     for job in jobs:
         table.add_row(
+            job.provider,
             job.batch_id,
-            job.state,
-            job.provider_status,
+            job.provider_status or job.state,
+            job.collection_state,
+            (
+                f"{job.completed_count} ok / {job.failed_count} failed"
+                if job.total_count
+                else ""
+            ),
             Path(job.input_path).name,
             job.updated_at,
-            job.error_summary or "",
+            job.last_local_error or job.error_summary or "",
         )
     console.print(table)
 
@@ -250,24 +258,25 @@ def list_jobs(
 
     async def fetch_jobs():
         try:
-            page = await provider.client.batches.list(limit=limit)
+            jobs = await provider.list_jobs(limit=limit)
             table = Table(title="Batch Jobs (provider)")
             table.add_column("Job ID", style="cyan")
             table.add_column("Status", style="magenta")
             table.add_column("Created At", style="green")
             table.add_column("Completed", style="blue")
             table.add_column("Failed", style="red")
-            for job in page.data:
-                created_at = datetime.fromtimestamp(job.created_at).strftime(
-                    "%Y-%m-%d %H:%M:%S"
+            for job in jobs:
+                created_at = (
+                    datetime.fromtimestamp(job.created_at).strftime("%Y-%m-%d %H:%M:%S")
+                    if job.created_at is not None
+                    else ""
                 )
-                counts = job.request_counts
                 table.add_row(
-                    job.id,
-                    job.status,
+                    job.batch_id,
+                    job.provider_status,
                     created_at,
-                    str(getattr(counts, "completed", "")),
-                    str(getattr(counts, "failed", "")),
+                    str(job.completed_count),
+                    str(job.failed_count),
                 )
             console.print(table)
         finally:
@@ -287,12 +296,12 @@ def cancel(
 
     async def cancel_job():
         try:
-            await provider.cancel(job_id)
-            job = store.get(job_id)
-            if job:
-                job.state = JobState.CANCELLED
-                store.update(job)
-            console.print(f"[green]Job {job_id} cancelled successfully.[/green]")
+            orchestrator = BatchOrchestrator(provider, store)
+            status = await orchestrator.request_cancel(job_id)
+            console.print(
+                f"[green]Cancellation requested for {job_id} "
+                f"(status: {status.provider_status}).[/green]"
+            )
         except Exception as e:
             console.print(f"[red]Error cancelling job {job_id}: {e}[/red]")
         finally:
@@ -314,17 +323,30 @@ def download(
     _require_api_key()
     output_dir = _default_output_dir(output_directory)
     provider = get_provider()
+    store = JobStore(config.db_file)
 
     async def download_results():
         try:
-            results = await provider.fetch_results(job_id, output_dir)
-            if results.output_path:
-                console.print(f"[green]Results saved to {results.output_path}[/green]")
-            if results.error_path:
+            job = store.get(job_id)
+            if job and job.state in TERMINAL_STATES:
+                orchestrator = BatchOrchestrator(provider, store)
+                job = await orchestrator.collect(job, output_dir)
+                if job.collection_state == CollectionState.FAILED:
+                    console.print(f"[red]{job.last_local_error}[/red]")
+                    return
+                output_path = job.output_path
+                error_path = job.error_path
+            else:
+                results = await provider.fetch_results(job_id, output_dir)
+                output_path = str(results.output_path) if results.output_path else None
+                error_path = str(results.error_path) if results.error_path else None
+            if output_path:
+                console.print(f"[green]Results saved to {output_path}[/green]")
+            if error_path:
                 console.print(
-                    f"[yellow]Per-request errors saved to {results.error_path}[/yellow]"
+                    f"[yellow]Per-request errors saved to {error_path}[/yellow]"
                 )
-            if not results.output_path and not results.error_path:
+            if not output_path and not error_path:
                 status = await provider.status(job_id)
                 console.print(
                     f"[yellow]No files available for {job_id} "
