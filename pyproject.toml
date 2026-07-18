@@ -20,10 +20,9 @@ classifiers = [
 dependencies = [
     "typer>=0.12",
     "rich>=13.7",
-    "openai>=1.37",
+    "openai>=2.46,<3",
     "pydantic>=2.8",
     "pydantic-settings>=2.3",
-    "aiofiles>=24.1",
     "loguru>=0.7",
     "python-dotenv>=1.0",
 ]

@@ -8,12 +8,17 @@ from pathlib import Path
 
 from loguru import logger
 
-from .models import JobRecord, JobState
+from .models import (
+    TERMINAL_STATES,
+    BatchStatus,
+    CollectionState,
+    JobRecord,
+)
 from .providers.base import BatchProvider
 from .store import JobStore
 from .utils import discover_jsonl
 
-# Consecutive status-poll failures tolerated before a job is marked failed
+# Retryable status failures tolerated in one watch invocation before it pauses.
 _MAX_POLL_FAILURES = 5
 
 
@@ -21,7 +26,7 @@ _MAX_POLL_FAILURES = 5
 class JobEvent:
     """Progress event emitted by the orchestrator; the UI subscribes to these."""
 
-    kind: str  # "log" | "submitted" | "status" | "finished"
+    kind: str  # "log" | "submitted" | "status" | "attention" | "finished"
     job: JobRecord | None = None
     message: str = ""
 
@@ -84,38 +89,49 @@ class BatchOrchestrator:
         return [job for job in results if job is not None]
 
     async def watch(self, jobs: list[JobRecord], output_dir: Path) -> list[JobRecord]:
-        """Poll jobs until terminal; download results/errors and update the manifest."""
+        """Advance actionable jobs and durably collect terminal artifacts."""
         if not jobs:
-            self._emit("log", message="No pending jobs to watch")
+            self._emit("log", message="No actionable jobs to watch")
             return []
         return list(
             await asyncio.gather(*(self._watch_job(job, output_dir) for job in jobs))
         )
 
     async def _watch_job(self, job: JobRecord, output_dir: Path) -> JobRecord:
+        if job.state in TERMINAL_STATES:
+            return await self.collect(job, output_dir)
+
         interval = self.check_interval
-        poll_failures = 0
+        watch_failures = 0
         while True:
             try:
                 status = await self.provider.status(job.batch_id)
-                poll_failures = 0
             except Exception as e:
-                poll_failures += 1
+                watch_failures += 1
+                job.poll_failures += 1
+                job.last_local_error = f"Status check failed: {e}"
+                self.store.update(job)
+                retryable = _is_retryable(e)
+                failure_limit = _MAX_POLL_FAILURES if retryable else 1
                 logger.warning(
                     f"Status check failed for {job.batch_id} "
-                    f"({poll_failures}/{_MAX_POLL_FAILURES}): {e}"
+                    f"({job.poll_failures}/{failure_limit}): {e}"
                 )
-                if poll_failures >= _MAX_POLL_FAILURES:
-                    job.state = JobState.FAILED
-                    job.error_summary = f"Lost contact with provider: {e}"
-                    self.store.update(job)
-                    self._emit("finished", job)
+                self._emit("attention", job, message=job.last_local_error)
+                if watch_failures >= failure_limit:
+                    self._emit(
+                        "log",
+                        job,
+                        message=(
+                            f"Paused watching {job.batch_id}; it remains actionable "
+                            "and a later 'batchwizard watch' will retry it"
+                        ),
+                    )
                     return job
                 await asyncio.sleep(interval)
                 continue
 
-            job.provider_status = status.provider_status
-            job.error_summary = status.error_summary or job.error_summary
+            self._apply_status(job, status)
             progress = (
                 f"{status.completed_count}/{status.total_count}"
                 if status.total_count
@@ -123,31 +139,60 @@ class BatchOrchestrator:
             )
             self._emit("status", job, message=progress)
 
-            if status.state is not None:
-                job.state = status.state
-                try:
-                    results = await self.provider.fetch_results(
-                        job.batch_id, output_dir
-                    )
-                    job.output_path = (
-                        str(results.output_path) if results.output_path else None
-                    )
-                    job.error_path = (
-                        str(results.error_path) if results.error_path else None
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to download results for {job.batch_id}: {e}")
-                    self._emit(
-                        "log",
-                        message=f"Failed to download results for {job.batch_id}: {e}",
-                    )
+            if status.is_terminal:
                 self.store.update(job)
-                self._emit("finished", job)
-                return job
+                return await self.collect(job, output_dir)
 
             self.store.update(job)
             await asyncio.sleep(interval)
             interval = min(interval * 1.5, 60)  # exponential backoff
+
+    def _apply_status(self, job: JobRecord, status: BatchStatus) -> None:
+        job.provider_status = status.provider_status
+        if status.state is not None:
+            job.state = status.state
+        job.completed_count = status.completed_count
+        job.failed_count = status.failed_count
+        job.cancelled_count = status.cancelled_count
+        job.expired_count = status.expired_count
+        job.total_count = status.total_count
+        job.error_summary = status.error_summary
+        job.last_local_error = None
+        job.poll_failures = 0
+        if status.is_terminal and job.collection_state != CollectionState.COLLECTED:
+            job.collection_state = CollectionState.PENDING
+
+    async def collect(self, job: JobRecord, output_dir: Path) -> JobRecord:
+        """Collect terminal artifacts idempotently and persist retryable failures."""
+        if job.state not in TERMINAL_STATES:
+            raise ValueError(f"Cannot collect non-terminal job {job.batch_id}")
+        try:
+            results = await self.provider.fetch_results(job.batch_id, output_dir)
+        except Exception as e:
+            job.collection_state = CollectionState.FAILED
+            job.last_local_error = f"Artifact collection failed: {e}"
+            self.store.update(job)
+            logger.error(f"Failed to collect artifacts for {job.batch_id}: {e}")
+            self._emit("attention", job, message=job.last_local_error)
+            return job
+
+        job.output_path = str(results.output_path) if results.output_path else None
+        job.error_path = str(results.error_path) if results.error_path else None
+        job.collection_state = CollectionState.COLLECTED
+        job.last_local_error = None
+        self.store.update(job)
+        self._emit("finished", job)
+        return job
+
+    async def request_cancel(self, batch_id: str) -> BatchStatus:
+        """Request cancellation without pretending it has already completed."""
+        status = await self.provider.cancel(batch_id)
+        job = self.store.get(batch_id)
+        if job:
+            self._apply_status(job, status)
+            self.store.update(job)
+            self._emit("status", job)
+        return status
 
     async def process(
         self,
@@ -158,3 +203,11 @@ class BatchOrchestrator:
         """Submit and then watch to completion (the classic blocking flow)."""
         jobs = await self.submit_paths(input_paths, endpoint)
         return await self.watch(jobs, output_dir)
+
+
+def _is_retryable(error: Exception) -> bool:
+    """Follow common HTTP retry semantics without importing a provider SDK."""
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        return True
+    return status_code in {408, 409, 429} or status_code >= 500

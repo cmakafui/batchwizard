@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Set
 from pathlib import Path
 
-from .models import JobRecord, JobState, utcnow
+from .models import (
+    ACTIONABLE_COLLECTION_STATES,
+    ACTIVE_STATES,
+    TERMINAL_STATES,
+    CollectionState,
+    JobRecord,
+    JobState,
+    utcnow,
+)
+
+_LATEST_SCHEMA_VERSION = 1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -15,9 +26,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     endpoint TEXT NOT NULL,
     state TEXT NOT NULL,
     provider_status TEXT NOT NULL DEFAULT '',
+    collection_state TEXT NOT NULL DEFAULT 'not_ready',
+    completed_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    cancelled_count INTEGER NOT NULL DEFAULT 0,
+    expired_count INTEGER NOT NULL DEFAULT 0,
+    total_count INTEGER NOT NULL DEFAULT 0,
     output_path TEXT,
     error_path TEXT,
     error_summary TEXT,
+    last_local_error TEXT,
+    poll_failures INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -30,9 +49,17 @@ _FIELDS = [
     "endpoint",
     "state",
     "provider_status",
+    "collection_state",
+    "completed_count",
+    "failed_count",
+    "cancelled_count",
+    "expired_count",
+    "total_count",
     "output_path",
     "error_path",
     "error_summary",
+    "last_local_error",
+    "poll_failures",
     "created_at",
     "updated_at",
 ]
@@ -46,8 +73,69 @@ class JobStore:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute(_SCHEMA)
-        self.conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Create or transactionally migrate the manifest schema."""
+        exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+        ).fetchone()
+        if not exists:
+            with self.conn:
+                self.conn.execute(_SCHEMA)
+                self.conn.execute(f"PRAGMA user_version = {_LATEST_SCHEMA_VERSION}")
+            return
+
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > _LATEST_SCHEMA_VERSION:
+            self.conn.close()
+            raise RuntimeError(
+                f"Job manifest schema {version} is newer than this BatchWizard "
+                f"supports ({_LATEST_SCHEMA_VERSION})"
+            )
+        if version == 0:
+            self._migrate_v0_to_v1()
+
+    def _migrate_v0_to_v1(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(jobs)")}
+        additions = {
+            "collection_state": "TEXT NOT NULL DEFAULT 'not_ready'",
+            "completed_count": "INTEGER NOT NULL DEFAULT 0",
+            "failed_count": "INTEGER NOT NULL DEFAULT 0",
+            "cancelled_count": "INTEGER NOT NULL DEFAULT 0",
+            "expired_count": "INTEGER NOT NULL DEFAULT 0",
+            "total_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_local_error": "TEXT",
+            "poll_failures": "INTEGER NOT NULL DEFAULT 0",
+        }
+        with self.conn:
+            for name, declaration in additions.items():
+                if name not in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE jobs ADD COLUMN {name} {declaration}"
+                    )
+            terminal = tuple(state.value for state in TERMINAL_STATES)
+            placeholders = ", ".join("?" for _ in terminal)
+            self.conn.execute(
+                f"""
+                UPDATE jobs
+                SET collection_state = CASE
+                    WHEN state IN ({placeholders})
+                         AND (output_path IS NOT NULL OR error_path IS NOT NULL)
+                        THEN ?
+                    WHEN state IN ({placeholders}) THEN ?
+                    ELSE ?
+                END
+                """,
+                [
+                    *terminal,
+                    CollectionState.COLLECTED.value,
+                    *terminal,
+                    CollectionState.PENDING.value,
+                    CollectionState.NOT_READY.value,
+                ],
+            )
+            self.conn.execute("PRAGMA user_version = 1")
 
     def add(self, job: JobRecord) -> JobRecord:
         cur = self.conn.execute(
@@ -73,19 +161,41 @@ class JobStore:
         ).fetchone()
         return JobRecord(**dict(row)) if row else None
 
-    def list(self, states: set[JobState] | None = None) -> list[JobRecord]:
+    def list(self, states: Set[JobState] | None = None) -> list[JobRecord]:
         if states:
-            placeholders = ", ".join("?" * len(states))
+            values = [state.value for state in states]
+            placeholders = ", ".join("?" for _ in values)
             rows = self.conn.execute(
                 f"SELECT * FROM jobs WHERE state IN ({placeholders}) ORDER BY id",
-                [s.value for s in states],
+                values,
             ).fetchall()
         else:
             rows = self.conn.execute("SELECT * FROM jobs ORDER BY id").fetchall()
         return [JobRecord(**dict(row)) for row in rows]
 
     def pending(self) -> list[JobRecord]:
-        return self.list({JobState.PENDING})
+        """Return jobs whose remote execution is still active."""
+        return self.list(ACTIVE_STATES)
+
+    def actionable(self) -> list[JobRecord]:
+        """Return remote-active jobs plus terminal jobs needing collection."""
+        active = [state.value for state in ACTIVE_STATES]
+        terminal = [state.value for state in TERMINAL_STATES]
+        collection = [state.value for state in ACTIONABLE_COLLECTION_STATES]
+        active_marks = ", ".join("?" for _ in active)
+        terminal_marks = ", ".join("?" for _ in terminal)
+        collection_marks = ", ".join("?" for _ in collection)
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM jobs
+            WHERE state IN ({active_marks})
+               OR (state IN ({terminal_marks})
+                   AND collection_state IN ({collection_marks}))
+            ORDER BY id
+            """,
+            [*active, *terminal, *collection],
+        ).fetchall()
+        return [JobRecord(**dict(row)) for row in rows]
 
     def close(self) -> None:
         self.conn.close()
