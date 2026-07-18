@@ -136,10 +136,9 @@ batchwizard configure --provider anthropic --set-key "$ANTHROPIC_API_KEY"
 batchwizard configure --show --provider openai
 ```
 
-Persisted keys are plaintext JSON. BatchWizard writes the configuration
-atomically with owner-only file permissions, but it does not use the operating
-system keychain in v0.5. Treat that file as a secret; keyring-backed storage is
-deferred to v0.6.
+Persisted keys are plaintext JSON, written atomically with owner-only file
+permissions. Treat that file as a secret. Prefer environment variables (or a
+`.env` file) if you'd rather not have keys on disk at all.
 
 ## Commands
 
