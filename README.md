@@ -1,8 +1,8 @@
 # BatchWizard
 
-BatchWizard is one durable CLI for OpenAI and Anthropic batch jobs. Submit
+BatchWizard is a durable CLI for OpenAI and Anthropic batch jobs. Submit
 provider-native JSONL, close the terminal, and come back later: a local SQLite
-manifest remembers what is running, what still needs to be downloaded, and what
+manifest tracks what is running, what still needs to be downloaded, and what
 needs your attention.
 
 It does not translate prompts between APIs. OpenAI and Anthropic have
