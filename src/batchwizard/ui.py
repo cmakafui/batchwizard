@@ -33,6 +33,10 @@ _COLLECTION_COLORS = {
 }
 
 
+def _job_label(job: JobRecord) -> str:
+    return f"{job.provider}:{job.reference}"
+
+
 class Dashboard:
     """Live terminal dashboard driven by orchestrator JobEvents."""
 
@@ -53,15 +57,15 @@ class Dashboard:
             key = (event.job.provider, event.job.reference)
             self.jobs[key] = event.job
             if event.kind == "submitted":
-                self.logs.append(f"Submitted {event.job.reference}")
+                self.logs.append(f"Submitted {_job_label(event.job)}")
             elif event.kind == "status" and event.message:
                 self.progress[key] = event.message
             elif event.kind == "attention":
-                self.logs.append(f"Job {event.job.reference} needs attention")
+                self.logs.append(f"Job {_job_label(event.job)} needs attention")
                 if event.message:
                     self.logs.append(f"  ↳ {event.message}")
             elif event.kind == "finished":
-                self.logs.append(f"Job {event.job.batch_id}: {event.job.state}")
+                self.logs.append(f"Job {_job_label(event.job)}: {event.job.state}")
                 if event.job.error_summary:
                     self.logs.append(f"  ↳ {event.job.error_summary}")
                 if event.job.output_path:
@@ -159,31 +163,36 @@ class Dashboard:
             self._live = None
 
     def print_summary(self) -> None:
-        collected = sum(
-            1
-            for job in self.jobs.values()
-            if job.collection_state == CollectionState.COLLECTED
-        )
         actionable = sum(1 for job in self.jobs.values() if job.is_actionable)
-        unavailable = sum(
-            1
-            for job in self.jobs.values()
-            if job.collection_state == CollectionState.UNAVAILABLE
-        )
         headline = (
             "[bold yellow]Watch paused with actionable jobs.[/bold yellow]"
             if actionable
             else "[bold green]All available artifacts collected.[/bold green]"
         )
         self.console.print(headline)
-        self.console.print(f"Total jobs: {len(self.jobs)}")
-        self.console.print(f"Artifacts collected: {collected}")
-        self.console.print(f"Artifacts unavailable: {unavailable}")
-        self.console.print(f"Still actionable: {actionable}")
+        for provider in sorted({job.provider for job in self.jobs.values()}):
+            provider_jobs = [
+                job for job in self.jobs.values() if job.provider == provider
+            ]
+            provider_collected = sum(
+                job.collection_state == CollectionState.COLLECTED
+                for job in provider_jobs
+            )
+            provider_unavailable = sum(
+                job.collection_state == CollectionState.UNAVAILABLE
+                for job in provider_jobs
+            )
+            provider_actionable = sum(job.is_actionable for job in provider_jobs)
+            self.console.print(
+                f"{provider}: {len(provider_jobs)} jobs, "
+                f"{provider_collected} collected, "
+                f"{provider_unavailable} unavailable, "
+                f"{provider_actionable} actionable"
+            )
         for job in self.jobs.values():
             if job.error_summary:
-                self.console.print(f"[red]{job.reference}[/red]: {job.error_summary}")
+                self.console.print(f"[red]{_job_label(job)}[/red]: {job.error_summary}")
             if job.last_local_error:
                 self.console.print(
-                    f"[yellow]{job.reference}[/yellow]: {job.last_local_error}"
+                    f"[yellow]{_job_label(job)}[/yellow]: {job.last_local_error}"
                 )

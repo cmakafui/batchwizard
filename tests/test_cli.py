@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 import batchwizard.cli as cli
@@ -15,6 +16,36 @@ from batchwizard.models import (
 from batchwizard.store import JobStore
 
 runner = CliRunner()
+
+
+def test_root_help_describes_the_shipped_providers():
+    result = runner.invoke(cli.app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "Manage LLM batch jobs across OpenAI and Anthropic" in result.stdout
+    assert "Gemini" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "process",
+        "submit",
+        "watch",
+        "status",
+        "configure",
+        "reconcile",
+        "list-jobs",
+        "cancel",
+        "download",
+    ],
+)
+def test_command_help_surfaces(command):
+    result = runner.invoke(cli.app, [command, "--help"])
+
+    assert result.exit_code == 0
+    assert "Usage:" in result.stdout
+    assert "--help" in result.stdout
 
 
 class CliProvider:
@@ -76,6 +107,29 @@ def test_status_defaults_to_actionable_jobs(tmp_path, monkeypatch):
     assert "batch_retry" in result.stdout
     assert "disk full" in result.stdout
     assert "batch_done" not in result.stdout
+
+
+def test_status_renders_provider_for_seeded_manifest(tmp_path, monkeypatch):
+    database = tmp_path / "jobs.db"
+    store = JobStore(database)
+    store.add(
+        JobRecord(
+            provider="anthropic",
+            batch_id="msgbatch_seeded",
+            input_path="/tmp/anthropic.jsonl",
+            endpoint="/v1/messages/batches",
+            provider_status="in_progress",
+        )
+    )
+    store.close()
+    monkeypatch.setattr(cli, "config", SimpleNamespace(db_file=database))
+
+    result = runner.invoke(cli.app, ["status"], env={"COLUMNS": "180"})
+
+    assert result.exit_code == 0
+    assert "Provider" in result.stdout
+    assert "anthropic" in result.stdout
+    assert "msgbatch_seeded" in result.stdout
 
 
 def test_list_jobs_uses_provider_contract_without_sdk_client(monkeypatch):
