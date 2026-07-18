@@ -1,152 +1,160 @@
 # processor.py
+from __future__ import annotations
+
 import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-import aiofiles
 from loguru import logger
-from openai import AsyncOpenAI
 
-from .config import config
-from .models import BatchJob, BatchJobResult
+from .models import JobRecord, JobState
+from .providers.base import BatchProvider
+from .store import JobStore
+from .utils import discover_jsonl
+
+# Consecutive status-poll failures tolerated before a job is marked failed
+_MAX_POLL_FAILURES = 5
 
 
-class BatchProcessor:
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=config.get_api_key())
-        self.settings = config.settings
+@dataclass
+class JobEvent:
+    """Progress event emitted by the orchestrator; the UI subscribes to these."""
 
-    async def upload_file(self, file_path: Path) -> str | None:
-        try:
-            async with aiofiles.open(file_path, "rb") as file:
-                file_content = await file.read()
+    kind: str  # "log" | "submitted" | "status" | "finished"
+    job: JobRecord | None = None
+    message: str = ""
 
-            response = await self.client.files.create(
-                file=(file_path.name, file_content), purpose="batch"
-            )
-            logger.info(
-                f"File uploaded successfully: {response.id}, Filename: {file_path.name}"
-            )
-            return response.id
-        except Exception as e:
-            logger.error(f"Error uploading file {file_path.name}: {str(e)}")
-            return None
 
-    async def create_batch_job(self, input_file_id: str) -> BatchJob | None:
-        try:
-            batch_job = await self.client.batches.create(
-                input_file_id=input_file_id,
-                endpoint="/v1/chat/completions",
-                completion_window="24h",
-            )
-            logger.info(f"Created batch job with ID: {batch_job.id}")
-            return BatchJob(
-                id=batch_job.id,
-                status=self.normalize_status(batch_job.status),
-                input_file_id=input_file_id,
-            )
-        except Exception as e:
-            logger.error(f"Error creating batch job: {str(e)}")
-            return None
+EventCallback = Callable[[JobEvent], None]
 
-    async def check_batch_status(self, batch_id: str) -> str | None:
-        try:
-            batch_job = await self.client.batches.retrieve(batch_id)
-            return self.normalize_status(batch_job.status)
-        except Exception as e:
-            logger.error(f"Error checking batch status: {str(e)}")
-            return None
 
-    def normalize_status(self, status: str) -> str:
-        """Normalize the status string to lowercase with underscores."""
-        return status.lower().replace(" ", "_")
+class BatchOrchestrator:
+    def __init__(
+        self,
+        provider: BatchProvider,
+        store: JobStore,
+        on_event: EventCallback | None = None,
+        check_interval: float = 5,
+        max_concurrent_jobs: int = 5,
+    ):
+        self.provider = provider
+        self.store = store
+        self.on_event = on_event
+        self.check_interval = check_interval
+        self.max_concurrent_jobs = max_concurrent_jobs
 
-    async def download_batch_results(self, batch_job, output_file_path: Path) -> bool:
-        try:
-            if batch_job.status == "completed" and batch_job.output_file_id:
-                result = await self.client.files.content(batch_job.output_file_id)
-                async with aiofiles.open(output_file_path, "wb") as file:
-                    await file.write(result.content)
-                logger.info(f"Downloaded results to {output_file_path}")
-                return True
-            else:
-                logger.warning(
-                    f"Batch job not completed or missing output file. Status: {batch_job.status}"
-                )
-                return False
-        except Exception as e:
-            logger.error(f"Error downloading batch results: {str(e)}")
-            return False
+    def _emit(self, kind: str, job: JobRecord | None = None, message: str = "") -> None:
+        if self.on_event:
+            self.on_event(JobEvent(kind=kind, job=job, message=message))
 
-    async def process_batch_job(
-        self, batch_job: BatchJob, output_dir: Path
-    ) -> BatchJobResult:
-        check_interval = self.settings.check_interval
-        while True:
-            status = await self.check_batch_status(batch_job.id)
-            if status == "completed":
-                try:
-                    batch_job = await self.client.batches.retrieve(batch_job.id)
-                    if batch_job.output_file_id:
-                        output_file = output_dir / f"{batch_job.id}_results.jsonl"
-                        if await self.download_batch_results(batch_job, output_file):
-                            logger.info(
-                                f"Successfully processed batch job {batch_job.id}"
-                            )
-                            return BatchJobResult(
-                                job_id=batch_job.id,
-                                success=True,
-                                output_file_path=output_file,
-                            )
-                    else:
-                        logger.error(
-                            f"No output file ID found for completed batch job {batch_job.id}"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Error processing completed batch job {batch_job.id}: {str(e)}"
-                    )
-            elif status in ["failed", "expired", "cancelled"]:
-                logger.error(f"Batch job {batch_job.id} {status}")
-                return BatchJobResult(job_id=batch_job.id, success=False)
-            elif status is None:
-                logger.error(f"Failed to retrieve status for batch job {batch_job.id}")
-                return BatchJobResult(job_id=batch_job.id, success=False)
-
-            await asyncio.sleep(check_interval)
-            check_interval = min(
-                check_interval * 1.5, 60
-            )  # Implement exponential backoff
-
-    async def process_inputs(
-        self, input_paths: list[Path], output_dir: Path
-    ) -> list[BatchJobResult]:
-        input_files = []
-        for path in input_paths:
-            if path.is_dir():
-                input_files.extend(path.glob("*.jsonl"))
-            elif path.suffix.lower() == ".jsonl":
-                input_files.append(path)
-            else:
-                logger.warning(f"Skipping non-JSONL file: {path}")
-
-        if not input_files:
-            logger.warning("No input files found in the provided paths")
+    async def submit_paths(
+        self, input_paths: list[Path], endpoint: str = "/v1/chat/completions"
+    ) -> list[JobRecord]:
+        """Upload inputs, create batches, and record them in the manifest."""
+        files = discover_jsonl(input_paths)
+        if not files:
+            self._emit("log", message="No JSONL files found in the provided paths")
             return []
 
-        semaphore = asyncio.Semaphore(self.settings.max_concurrent_jobs)
+        semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
 
-        async def process_file(input_file: Path) -> BatchJobResult | None:
+        async def submit_one(input_file: Path) -> JobRecord | None:
             async with semaphore:
-                file_id = await self.upload_file(input_file)
-                if file_id:
-                    batch_job = await self.create_batch_job(file_id)
-                    if batch_job:
-                        return await self.process_batch_job(batch_job, output_dir)
-            return None
+                try:
+                    batch_id = await self.provider.submit(input_file, endpoint)
+                except Exception as e:
+                    logger.error(f"Failed to submit {input_file.name}: {e}")
+                    self._emit(
+                        "log", message=f"Failed to submit {input_file.name}: {e}"
+                    )
+                    return None
+            job = self.store.add(
+                JobRecord(
+                    provider=self.provider.name,
+                    batch_id=batch_id,
+                    input_path=str(input_file),
+                    endpoint=endpoint,
+                )
+            )
+            self._emit("submitted", job)
+            return job
 
-        tasks = [process_file(file) for file in input_files]
-        results = await asyncio.gather(*tasks)
-        return [result for result in results if result is not None]
+        results = await asyncio.gather(*(submit_one(f) for f in files))
+        return [job for job in results if job is not None]
 
-    async def close(self):
-        await self.client.close()
+    async def watch(self, jobs: list[JobRecord], output_dir: Path) -> list[JobRecord]:
+        """Poll jobs until terminal; download results/errors and update the manifest."""
+        if not jobs:
+            self._emit("log", message="No pending jobs to watch")
+            return []
+        return list(
+            await asyncio.gather(*(self._watch_job(job, output_dir) for job in jobs))
+        )
+
+    async def _watch_job(self, job: JobRecord, output_dir: Path) -> JobRecord:
+        interval = self.check_interval
+        poll_failures = 0
+        while True:
+            try:
+                status = await self.provider.status(job.batch_id)
+                poll_failures = 0
+            except Exception as e:
+                poll_failures += 1
+                logger.warning(
+                    f"Status check failed for {job.batch_id} "
+                    f"({poll_failures}/{_MAX_POLL_FAILURES}): {e}"
+                )
+                if poll_failures >= _MAX_POLL_FAILURES:
+                    job.state = JobState.FAILED
+                    job.error_summary = f"Lost contact with provider: {e}"
+                    self.store.update(job)
+                    self._emit("finished", job)
+                    return job
+                await asyncio.sleep(interval)
+                continue
+
+            job.provider_status = status.provider_status
+            job.error_summary = status.error_summary or job.error_summary
+            progress = (
+                f"{status.completed_count}/{status.total_count}"
+                if status.total_count
+                else ""
+            )
+            self._emit("status", job, message=progress)
+
+            if status.state is not None:
+                job.state = status.state
+                try:
+                    results = await self.provider.fetch_results(
+                        job.batch_id, output_dir
+                    )
+                    job.output_path = (
+                        str(results.output_path) if results.output_path else None
+                    )
+                    job.error_path = (
+                        str(results.error_path) if results.error_path else None
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to download results for {job.batch_id}: {e}")
+                    self._emit(
+                        "log",
+                        message=f"Failed to download results for {job.batch_id}: {e}",
+                    )
+                self.store.update(job)
+                self._emit("finished", job)
+                return job
+
+            self.store.update(job)
+            await asyncio.sleep(interval)
+            interval = min(interval * 1.5, 60)  # exponential backoff
+
+    async def process(
+        self,
+        input_paths: list[Path],
+        output_dir: Path,
+        endpoint: str = "/v1/chat/completions",
+    ) -> list[JobRecord]:
+        """Submit and then watch to completion (the classic blocking flow)."""
+        jobs = await self.submit_paths(input_paths, endpoint)
+        return await self.watch(jobs, output_dir)

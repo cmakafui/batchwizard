@@ -77,12 +77,44 @@ You can also process multiple files or directories:
 batchwizard process /path/to/file1.jsonl /path/to/directory_with_jsonl_files /path/to/file2.jsonl
 ```
 
-### List Recent Jobs
+### Submit Without Blocking (fire and forget)
 
-To list recent batch jobs:
+`process` blocks until every batch completes — which can take up to 24 hours. To submit and get your terminal back:
 
 ```bash
-batchwizard list-jobs [--limit NUM] [--all]
+batchwizard submit /path/to/inputs/           # or: batchwizard process ... --submit-only
+```
+
+Submitted jobs are recorded in a local manifest (SQLite, in the BatchWizard config directory). Later — even after a reboot — reattach with:
+
+```bash
+batchwizard watch [--output-directory OUTPUT_DIR]
+```
+
+`watch` picks up every pending job from the manifest, polls until completion, and downloads the results.
+
+### Check Tracked Jobs
+
+```bash
+batchwizard status [--all]
+```
+
+Shows pending jobs from the local manifest (`--all` includes finished ones), with any failure reasons.
+
+### Failure Reasons and Error Files
+
+When a batch fails, BatchWizard surfaces the provider's actual error (e.g. `insufficient_funds`, `invalid_request` with the offending line). When individual requests inside a batch fail, the per-request error file is downloaded alongside the results as `<batch_id>_errors.jsonl`.
+
+### Batch Endpoints
+
+By default requests go to `/v1/chat/completions`. Use `--endpoint` on `process`/`submit` for other batch-capable endpoints such as `/v1/responses` or `/v1/embeddings`.
+
+### List Recent Jobs
+
+To list recent batch jobs from the provider:
+
+```bash
+batchwizard list-jobs [--limit NUM]
 ```
 
 ### Cancel a Job
@@ -98,8 +130,10 @@ batchwizard cancel <job_id>
 To download results for a completed batch job:
 
 ```bash
-batchwizard download <job_id> [--output-file FILE_PATH]
+batchwizard download <job_id> [--output-directory OUTPUT_DIR]
 ```
+
+This downloads the results file and, if any requests failed, the per-request error file.
 
 ## Configuration
 
@@ -131,11 +165,14 @@ batchwizard configure --reset
 
 BatchWizard supports the following commands:
 
-- `process`: Process batch jobs from input files or directories.
+- `process`: Submit batch jobs and wait for completion (add `--submit-only` to return immediately).
+- `submit`: Submit batch jobs and exit; jobs are tracked in the local manifest.
+- `watch`: Reattach to pending jobs, poll, and download results.
+- `status`: Show jobs tracked in the local manifest.
 - `configure`: Manage BatchWizard configuration.
-- `list-jobs`: List recent batch jobs.
+- `list-jobs`: List recent batch jobs from the provider.
 - `cancel`: Cancel a specific batch job.
-- `download`: Download results for a completed batch job.
+- `download`: Download results (and error file) for a batch job.
 
 For detailed information on each command, use the `--help` option:
 
@@ -167,7 +204,7 @@ We welcome contributions to BatchWizard! To contribute, follow these steps:
 To run tests, use `pytest`:
 
 ```bash
-pytest --cov=batchwizard tests/
+uv run pytest tests/
 ```
 
 Ensure your code passes all tests and meets the coding standards before opening a pull request.

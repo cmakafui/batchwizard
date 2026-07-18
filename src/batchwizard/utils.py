@@ -1,9 +1,24 @@
 # utils.py
 
+from pathlib import Path
+
 from loguru import logger
 from rich.console import Console
 
 from .config import config
+
+
+def discover_jsonl(paths: list[Path]) -> list[Path]:
+    """Collect JSONL files from a mix of file and directory paths (single source of truth)."""
+    files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            files.extend(sorted(path.glob("*.jsonl")))
+        elif path.suffix.lower() == ".jsonl":
+            files.append(path)
+        else:
+            logger.warning(f"Skipping non-JSONL file: {path}")
+    return files
 
 
 def setup_logger(console: Console = None):
