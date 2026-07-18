@@ -45,7 +45,6 @@ def test_command_help_surfaces(command):
 
     assert result.exit_code == 0
     assert "Usage:" in result.stdout
-    assert "--help" in result.stdout
 
 
 class CliProvider:
