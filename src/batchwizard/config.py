@@ -3,12 +3,14 @@ import os
 from pathlib import Path
 
 import typer
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class BatchWizardSettings(BaseSettings):
-    api_key: str | None = Field(None, env="OPENAI_API_KEY")
+    api_key: str | None = Field(
+        None, validation_alias=AliasChoices("api_key", "OPENAI_API_KEY")
+    )
     max_concurrent_jobs: int = 5
     check_interval: int = 5
     model_config = SettingsConfigDict(
@@ -26,6 +28,10 @@ class Config(BaseModel):
     @property
     def config_file(self) -> Path:
         return self.config_dir / "config.json"
+
+    @property
+    def db_file(self) -> Path:
+        return self.config_dir / "jobs.db"
 
     def load(self) -> None:
         if self.config_file.exists():

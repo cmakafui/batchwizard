@@ -1,4 +1,6 @@
 # cli.py
+from __future__ import annotations
+
 import asyncio
 from datetime import datetime
 from pathlib import Path
@@ -8,13 +10,51 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import BatchWizardSettings, config
-from .processor import BatchProcessor
-from .ui import BatchWizardUI
+from .models import JobState
+from .processor import BatchOrchestrator
+from .providers import get_provider
+from .store import JobStore
+from .ui import Dashboard
 from .utils import get_api_key, set_api_key, setup_logger
 
-app = typer.Typer(help="BatchWizard: Manage OpenAI batch processing jobs with ease")
+app = typer.Typer(help="BatchWizard: Manage LLM batch processing jobs with ease")
 console = Console()
 logger = setup_logger(console)
+
+DEFAULT_ENDPOINT = "/v1/chat/completions"
+
+
+def _require_api_key() -> None:
+    if not get_api_key():
+        logger.error(
+            "API key not set. Please set it using 'batchwizard configure --set-key YOUR_API_KEY'"
+        )
+        raise typer.Exit(code=1)
+
+
+def _default_output_dir(output_directory: Path | None) -> Path:
+    out = output_directory or Path.cwd() / "results"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _run(coro) -> None:
+    asyncio.run(coro)
+
+
+def _print_submitted(jobs) -> None:
+    if not jobs:
+        console.print("[yellow]Nothing submitted.[/yellow]")
+        return
+    table = Table(title="Submitted Batches")
+    table.add_column("Batch ID", style="cyan")
+    table.add_column("Input", style="green")
+    for job in jobs:
+        table.add_row(job.batch_id, job.input_path)
+    console.print(table)
+    console.print(
+        "Run [bold]batchwizard watch[/bold] any time to poll and download results."
+    )
 
 
 @app.command()
@@ -31,33 +71,142 @@ def process(
     check_interval: int = typer.Option(
         5, help="Initial interval (in seconds) between job status checks"
     ),
+    endpoint: str = typer.Option(
+        DEFAULT_ENDPOINT,
+        help="Batch endpoint (e.g. /v1/chat/completions, /v1/responses, /v1/embeddings)",
+    ),
+    submit_only: bool = typer.Option(
+        False,
+        "--submit-only",
+        help="Submit the batches and exit without waiting for completion",
+    ),
 ):
     """Process batch jobs from input files or directories."""
-    if not output_directory:
-        output_directory = Path.cwd() / "results"
-    output_directory.mkdir(parents=True, exist_ok=True)
+    _require_api_key()
+    output_dir = _default_output_dir(output_directory)
+    provider = get_provider()
+    store = JobStore(config.db_file)
 
-    api_key = get_api_key()
-    if not api_key:
-        logger.error(
-            "API key not set. Please set it using 'batchwizard configure --set-key YOUR_API_KEY'"
+    if submit_only:
+
+        async def submit():
+            orchestrator = BatchOrchestrator(provider, store)
+            try:
+                return await orchestrator.submit_paths(input_paths, endpoint)
+            finally:
+                await provider.close()
+
+        _print_submitted(asyncio.run(submit()))
+        return
+
+    dashboard = Dashboard(Console(), title="BatchWizard Processing")
+
+    async def run():
+        orchestrator = BatchOrchestrator(
+            provider,
+            store,
+            on_event=dashboard.on_event,
+            check_interval=check_interval,
+            max_concurrent_jobs=max_concurrent_jobs,
         )
-        raise typer.Exit(code=1)
-
-    # Per-run overrides only — not persisted to the saved configuration
-    config.settings.max_concurrent_jobs = max_concurrent_jobs
-    config.settings.check_interval = check_interval
-
-    processor = BatchProcessor()
-    ui = BatchWizardUI(Console())
-
-    async def run_and_close():
         try:
-            await ui.run_processing(processor, input_paths, output_directory)
+            with dashboard:
+                await orchestrator.process(input_paths, output_dir, endpoint)
         finally:
-            await processor.close()
+            await provider.close()
 
-    asyncio.run(run_and_close())
+    _run(run())
+    dashboard.print_summary()
+
+
+@app.command()
+def submit(
+    input_paths: list[Path] = typer.Argument(
+        ..., help="Paths to input files or directories to submit"
+    ),
+    endpoint: str = typer.Option(DEFAULT_ENDPOINT, help="Batch endpoint"),
+):
+    """Submit batch jobs and exit immediately (use 'watch' to collect results later)."""
+    _require_api_key()
+    provider = get_provider()
+    store = JobStore(config.db_file)
+
+    async def run():
+        orchestrator = BatchOrchestrator(provider, store)
+        try:
+            return await orchestrator.submit_paths(input_paths, endpoint)
+        finally:
+            await provider.close()
+
+    _print_submitted(asyncio.run(run()))
+
+
+@app.command()
+def watch(
+    output_directory: Path | None = typer.Option(
+        None, help="Directory to store output files"
+    ),
+    check_interval: int = typer.Option(
+        5, help="Initial interval (in seconds) between job status checks"
+    ),
+):
+    """Reattach to all pending jobs in the manifest; poll and download results."""
+    _require_api_key()
+    output_dir = _default_output_dir(output_directory)
+    provider = get_provider()
+    store = JobStore(config.db_file)
+    pending = store.pending()
+    if not pending:
+        console.print("[yellow]No pending jobs in the manifest.[/yellow]")
+        return
+
+    dashboard = Dashboard(Console(), title="BatchWizard Watch")
+    for job in pending:  # seed the table before polling starts
+        dashboard.jobs[job.batch_id] = job
+
+    async def run():
+        orchestrator = BatchOrchestrator(
+            provider, store, on_event=dashboard.on_event, check_interval=check_interval
+        )
+        try:
+            with dashboard:
+                await orchestrator.watch(pending, output_dir)
+        finally:
+            await provider.close()
+
+    _run(run())
+    dashboard.print_summary()
+
+
+@app.command()
+def status(
+    all: bool = typer.Option(
+        False, "--all", help="Show finished jobs too (default: pending only)"
+    ),
+):
+    """Show jobs tracked in the local manifest."""
+    store = JobStore(config.db_file)
+    jobs = store.list() if all else store.pending()
+    if not jobs:
+        console.print("[yellow]No jobs in the manifest.[/yellow]")
+        return
+    table = Table(title="Tracked Batch Jobs")
+    table.add_column("Batch ID", style="cyan")
+    table.add_column("State", style="magenta")
+    table.add_column("Provider Status")
+    table.add_column("Input", style="green")
+    table.add_column("Updated", style="dim")
+    table.add_column("Detail", style="red")
+    for job in jobs:
+        table.add_row(
+            job.batch_id,
+            job.state,
+            job.provider_status,
+            Path(job.input_path).name,
+            job.updated_at,
+            job.error_summary or "",
+        )
+    console.print(table)
 
 
 @app.command()
@@ -80,6 +229,7 @@ def configure(
         console.print(f"API Key: {masked_key}")
         console.print(f"Max Concurrent Jobs: {config.settings.max_concurrent_jobs}")
         console.print(f"Check Interval: {config.settings.check_interval} seconds")
+        console.print(f"Job manifest: {config.db_file}")
     elif reset:
         config.settings = BatchWizardSettings()
         config.save()
@@ -92,39 +242,38 @@ def configure(
 
 @app.command()
 def list_jobs(
-    limit: int = typer.Option(100, help="Number of jobs to display"),
-    all: bool = typer.Option(False, "--all", help="Display all jobs"),
+    limit: int = typer.Option(20, help="Number of jobs to display"),
 ):
-    """List recent batch jobs."""
+    """List recent batch jobs from the provider (not the local manifest)."""
+    _require_api_key()
+    provider = get_provider()
 
     async def fetch_jobs():
-        processor = BatchProcessor()
-        console = Console()  # Create a Console object directly
         try:
-            jobs = await processor.client.batches.list(limit=None if all else limit)
-            table = Table(title="Batch Jobs")
+            page = await provider.client.batches.list(limit=limit)
+            table = Table(title="Batch Jobs (provider)")
             table.add_column("Job ID", style="cyan")
             table.add_column("Status", style="magenta")
             table.add_column("Created At", style="green")
             table.add_column("Completed", style="blue")
             table.add_column("Failed", style="red")
-
-            for job in jobs.data:
+            for job in page.data:
                 created_at = datetime.fromtimestamp(job.created_at).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
+                counts = job.request_counts
                 table.add_row(
                     job.id,
                     job.status,
                     created_at,
-                    str(job.request_counts.completed),
-                    str(job.request_counts.failed),
+                    str(getattr(counts, "completed", "")),
+                    str(getattr(counts, "failed", "")),
                 )
-            console.print(table)  # Use the console object to print the table
+            console.print(table)
         finally:
-            await processor.close()
+            await provider.close()
 
-    asyncio.run(fetch_jobs())
+    _run(fetch_jobs())
 
 
 @app.command()
@@ -132,18 +281,24 @@ def cancel(
     job_id: str = typer.Argument(..., help="ID of the batch job to cancel"),
 ):
     """Cancel a specific batch job."""
+    _require_api_key()
+    provider = get_provider()
+    store = JobStore(config.db_file)
 
     async def cancel_job():
-        processor = BatchProcessor()
         try:
-            await processor.client.batches.cancel(job_id)
+            await provider.cancel(job_id)
+            job = store.get(job_id)
+            if job:
+                job.state = JobState.CANCELLED
+                store.update(job)
             console.print(f"[green]Job {job_id} cancelled successfully.[/green]")
         except Exception as e:
-            console.print(f"[red]Error cancelling job {job_id}: {str(e)}[/red]")
+            console.print(f"[red]Error cancelling job {job_id}: {e}[/red]")
         finally:
-            await processor.close()
+            await provider.close()
 
-    asyncio.run(cancel_job())
+    _run(cancel_job())
 
 
 @app.command()
@@ -151,39 +306,38 @@ def download(
     job_id: str = typer.Argument(
         ..., help="ID of the batch job to download results for"
     ),
-    output_file: Path = typer.Option(
-        None, help="Path to save the output file (default: <job_id>_results.jsonl)"
+    output_directory: Path | None = typer.Option(
+        None, help="Directory to store output files"
     ),
 ):
-    """Download results for a completed batch job."""
-    if not output_file:
-        output_file = Path(f"{job_id}_results.jsonl")
+    """Download results (and error file, if any) for a batch job."""
+    _require_api_key()
+    output_dir = _default_output_dir(output_directory)
+    provider = get_provider()
 
     async def download_results():
-        processor = BatchProcessor()
         try:
-            batch_job = await processor.client.batches.retrieve(job_id)
-            if batch_job.status != "completed":
+            results = await provider.fetch_results(job_id, output_dir)
+            if results.output_path:
+                console.print(f"[green]Results saved to {results.output_path}[/green]")
+            if results.error_path:
                 console.print(
-                    f"[yellow]Job {job_id} is not completed (status: {batch_job.status}). Cannot download results.[/yellow]"
+                    f"[yellow]Per-request errors saved to {results.error_path}[/yellow]"
                 )
-                return
-
-            success = await processor.download_batch_results(batch_job, output_file)
-            if success:
+            if not results.output_path and not results.error_path:
+                status = await provider.status(job_id)
                 console.print(
-                    f"[green]Results for job {job_id} downloaded successfully to {output_file}[/green]"
+                    f"[yellow]No files available for {job_id} "
+                    f"(status: {status.provider_status}).[/yellow]"
                 )
-            else:
-                console.print(f"[red]Failed to download results for job {job_id}[/red]")
+                if status.error_summary:
+                    console.print(f"[red]{status.error_summary}[/red]")
         except Exception as e:
-            console.print(
-                f"[red]Error downloading results for job {job_id}: {str(e)}[/red]"
-            )
+            console.print(f"[red]Error downloading results for {job_id}: {e}[/red]")
         finally:
-            await processor.close()
+            await provider.close()
 
-    asyncio.run(download_results())
+    _run(download_results())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 [project]
 name = "batchwizard"
-version = "0.3.0"
+version = "0.4.0"
 description = "BatchWizard: Manage OpenAI batch processing jobs with ease"
 readme = "README.md"
 license = "MIT"

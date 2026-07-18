@@ -1,6 +1,16 @@
 # __init__.py
 from .cli import app
-from .models import BatchJob, BatchJobResult
-from .processor import BatchProcessor
+from .models import BatchStatus, JobRecord, JobState
+from .processor import BatchOrchestrator
+from .providers import get_provider
+from .store import JobStore
 
-__all__ = ["BatchProcessor", "BatchJob", "BatchJobResult", "app"]
+__all__ = [
+    "BatchOrchestrator",
+    "BatchStatus",
+    "JobRecord",
+    "JobState",
+    "JobStore",
+    "app",
+    "get_provider",
+]
