@@ -76,7 +76,7 @@ class StubClient:
 
     async def _batch_create(self, **kwargs):
         self.created_batches.append(kwargs)
-        return SimpleNamespace(id="batch_new")
+        return SimpleNamespace(id="batch_new", status="validating")
 
     async def _batch_retrieve(self, batch_id):
         return self._batch
@@ -113,9 +113,11 @@ async def test_submit_uploads_and_creates_batch(tmp_path: Path):
         '"body":{"model":"gpt-5.4","input":"hello"}}\n'
     )
 
-    batch_id = await provider.submit(input_file, "/v1/responses")
+    submitted = await provider.submit(input_file, "/v1/responses")
 
-    assert batch_id == "batch_new"
+    assert submitted.batch_id == "batch_new"
+    assert submitted.provider_status == "validating"
+    assert submitted.endpoint == "/v1/responses"
     assert client.uploaded_files == [(input_file, "batch")]
     assert client.created_batches == [
         {

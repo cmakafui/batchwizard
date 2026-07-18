@@ -30,10 +30,13 @@ Artifact collection progresses independently:
 ```text
 not_ready -> pending -> collected
                    \-> failed -> pending (on the next retry)
+                   \-> unavailable
 ```
 
 `collected` means the collection attempt completed successfully. A provider may
 legitimately have no output or error file for a terminal job.
+`unavailable` means the provider has permanently removed or archived artifacts;
+it is terminal and is not retried.
 
 ## Actionable jobs
 
@@ -55,6 +58,8 @@ failure survives process exit and is retried by a later invocation.
 - Downloads are streamed to a temporary file in the destination directory and
   atomically renamed only after the stream completes.
 - A failed collection records `collection_state=failed` and remains actionable.
+- A provider-confirmed retention loss records `collection_state=unavailable` and
+  stops retrying without pretending the artifacts were collected.
 - Request-level errors do not change a successfully ended provider job into a
   provider failure; their counts and error artifact are recorded separately.
 - A cancellation request is not equivalent to cancellation completion. The
@@ -74,15 +79,23 @@ small operational contract:
 Input and result payloads remain provider-native. BatchWizard normalizes lifecycle
 and artifact locations, not model-specific request semantics.
 
+OpenAI exposes job-level terminal statuses. Anthropic exposes the neutral terminal
+status `ended` and independent `succeeded`, `errored`, `canceled`, and `expired`
+request counts. BatchWizard maps `ended` to a terminal normalized lifecycle while
+preserving those row outcomes; an all-errored Anthropic batch is not rewritten as
+a remote provider failure.
+
 ## Schema migrations
 
 The SQLite manifest uses `PRAGMA user_version`. Opening a v0.4 manifest migrates it
-to schema version 1 in place:
+through schema version 1 and then to version 2:
 
 - Active jobs start with artifact state `not_ready`.
 - Terminal jobs with an existing output or error path become `collected`.
 - Terminal jobs without a known local path become `pending` so collection is
   conservatively retried.
+- Version 2 makes `(provider, batch_id)` the durable identity. Provider-native IDs
+  no longer have to be globally unique across different providers.
 
 A manifest with a newer schema version is rejected rather than silently modified
 by an older BatchWizard release.

@@ -50,6 +50,7 @@ class CollectionState(StrEnum):
     PENDING = "pending"
     COLLECTED = "collected"
     FAILED = "failed"
+    UNAVAILABLE = "unavailable"
 
 
 ACTIONABLE_COLLECTION_STATES = frozenset(
@@ -121,12 +122,23 @@ class ProviderJobSummary(BaseModel):
 
     batch_id: str
     provider_status: str
-    created_at: int | None = None
+    created_at: datetime | None = None
     completed_count: int = 0
     failed_count: int = 0
+    cancelled_count: int = 0
+    expired_count: int = 0
     total_count: int = 0
+
+
+class SubmittedBatch(BaseModel):
+    """Provider submission result persisted in the local manifest."""
+
+    batch_id: str
+    provider_status: str
+    endpoint: str
 
 
 class DownloadedResults(BaseModel):
     output_path: Path | None = None
     error_path: Path | None = None
+    error_summary: str | None = None

@@ -1,5 +1,6 @@
 # config.py
 import os
+import tempfile
 from pathlib import Path
 
 import typer
@@ -8,8 +9,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class BatchWizardSettings(BaseSettings):
-    api_key: str | None = Field(
-        None, validation_alias=AliasChoices("api_key", "OPENAI_API_KEY")
+    openai_api_key: str | None = Field(
+        None,
+        validation_alias=AliasChoices("openai_api_key", "api_key", "OPENAI_API_KEY"),
+    )
+    anthropic_api_key: str | None = Field(
+        None,
+        validation_alias=AliasChoices("anthropic_api_key", "ANTHROPIC_API_KEY"),
     )
     max_concurrent_jobs: int = 5
     check_interval: int = 5
@@ -41,13 +47,42 @@ class Config(BaseModel):
 
     def save(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        self.config_file.write_text(self.settings.model_dump_json())
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=self.config_dir, prefix=".config.", suffix=".json.tmp"
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(self.settings.model_dump_json())
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self.config_file)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
-    def get_api_key(self) -> str | None:
-        return self.settings.api_key or os.getenv("OPENAI_API_KEY")
+    def get_api_key(self, provider: str = "openai") -> str | None:
+        fields = {
+            "openai": ("openai_api_key", "OPENAI_API_KEY"),
+            "anthropic": ("anthropic_api_key", "ANTHROPIC_API_KEY"),
+        }
+        try:
+            field, environment = fields[provider]
+        except KeyError:
+            raise ValueError(f"Unknown provider {provider!r}") from None
+        return getattr(self.settings, field) or os.getenv(environment)
 
-    def set_api_key(self, api_key: str) -> None:
-        self.settings.api_key = api_key
+    def set_api_key(self, api_key: str, provider: str = "openai") -> None:
+        fields = {
+            "openai": "openai_api_key",
+            "anthropic": "anthropic_api_key",
+        }
+        try:
+            field = fields[provider]
+        except KeyError:
+            raise ValueError(f"Unknown provider {provider!r}") from None
+        setattr(self.settings, field, api_key)
         self.save()
 
 

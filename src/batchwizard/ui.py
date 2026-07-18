@@ -28,6 +28,7 @@ _COLLECTION_COLORS = {
     CollectionState.PENDING: "yellow",
     CollectionState.COLLECTED: "green",
     CollectionState.FAILED: "red",
+    CollectionState.UNAVAILABLE: "magenta",
 }
 
 
@@ -37,8 +38,8 @@ class Dashboard:
     def __init__(self, console: Console | None = None, title: str = "BatchWizard"):
         self.console = console or Console()
         self.title = title
-        self.jobs: dict[str, JobRecord] = {}
-        self.progress: dict[str, str] = {}
+        self.jobs: dict[tuple[str, str], JobRecord] = {}
+        self.progress: dict[tuple[str, str], str] = {}
         self.logs: deque[str] = deque(maxlen=10)
         self._live: Live | None = None
 
@@ -48,11 +49,12 @@ class Dashboard:
         if event.kind == "log":
             self.logs.append(event.message)
         elif event.job is not None:
-            self.jobs[event.job.batch_id] = event.job
+            key = (event.job.provider, event.job.batch_id)
+            self.jobs[key] = event.job
             if event.kind == "submitted":
                 self.logs.append(f"Submitted {event.job.batch_id}")
             elif event.kind == "status" and event.message:
-                self.progress[event.job.batch_id] = event.message
+                self.progress[key] = event.message
             elif event.kind == "attention":
                 self.logs.append(f"Job {event.job.batch_id} needs attention")
                 if event.message:
@@ -72,18 +74,20 @@ class Dashboard:
 
     def _job_table(self) -> Table:
         table = Table(show_header=True, header_style="bold magenta", expand=True)
+        table.add_column("Provider", style="blue", no_wrap=True)
         table.add_column("Batch ID", style="dim", no_wrap=True)
         table.add_column("Status", style="bold")
         table.add_column("Progress", justify="right")
         table.add_column("Artifacts", style="bold")
-        for batch_id, job in self.jobs.items():
+        for key, job in self.jobs.items():
             color = _STATE_COLORS.get(job.state, "yellow")
             collection_color = _COLLECTION_COLORS[job.collection_state]
             label = job.provider_status or job.state
             table.add_row(
-                batch_id,
+                job.provider,
+                job.batch_id,
                 f"[{color}]{label}[/{color}]",
-                self.progress.get(batch_id, ""),
+                self.progress.get(key, ""),
                 (f"[{collection_color}]{job.collection_state}[/{collection_color}]"),
             )
         return table
@@ -101,12 +105,18 @@ class Dashboard:
             if job.collection_state == CollectionState.FAILED
             or job.last_local_error is not None
         )
+        unavailable = sum(
+            1
+            for job in self.jobs.values()
+            if job.collection_state == CollectionState.UNAVAILABLE
+        )
         table = Table(show_header=False, expand=True)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", justify="right")
         table.add_row("Total Jobs", str(len(self.jobs)))
         table.add_row("Remote Active", f"[yellow]{active}[/yellow]")
         table.add_row("Collected", f"[green]{collected}[/green]")
+        table.add_row("Unavailable", f"[magenta]{unavailable}[/magenta]")
         table.add_row("Needs Attention", f"[red]{attention}[/red]")
         return table
 
@@ -154,6 +164,11 @@ class Dashboard:
             if job.collection_state == CollectionState.COLLECTED
         )
         actionable = sum(1 for job in self.jobs.values() if job.is_actionable)
+        unavailable = sum(
+            1
+            for job in self.jobs.values()
+            if job.collection_state == CollectionState.UNAVAILABLE
+        )
         headline = (
             "[bold yellow]Watch paused with actionable jobs.[/bold yellow]"
             if actionable
@@ -162,6 +177,7 @@ class Dashboard:
         self.console.print(headline)
         self.console.print(f"Total jobs: {len(self.jobs)}")
         self.console.print(f"Artifacts collected: {collected}")
+        self.console.print(f"Artifacts unavailable: {unavailable}")
         self.console.print(f"Still actionable: {actionable}")
         for job in self.jobs.values():
             if job.error_summary:

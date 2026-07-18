@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from batchwizard.models import CollectionState, JobRecord, JobState
-from batchwizard.store import JobStore
+from batchwizard.store import AmbiguousJobError, JobStore
 
 
 def make_job(batch_id: str = "batch_1") -> JobRecord:
@@ -70,6 +70,18 @@ def test_duplicate_batch_id_rejected(store: JobStore):
         store.add(make_job("batch_dup"))
 
 
+def test_same_native_id_is_allowed_for_different_providers(store: JobStore):
+    store.add(make_job("shared_id"))
+    anthropic = make_job("shared_id")
+    anthropic.provider = "anthropic"
+    store.add(anthropic)
+
+    assert store.get("shared_id", provider="openai").provider == "openai"
+    assert store.get("shared_id", provider="anthropic").provider == "anthropic"
+    with pytest.raises(AmbiguousJobError, match="Specify --provider"):
+        store.get("shared_id")
+
+
 def test_store_survives_reopen(tmp_path):
     path = tmp_path / "jobs.db"
     s1 = JobStore(path)
@@ -98,6 +110,16 @@ def test_actionable_includes_active_and_failed_collection(store: JobStore):
         "batch_active",
         "batch_collect",
     ]
+
+
+def test_unavailable_artifacts_are_terminal_and_not_actionable(store: JobStore):
+    job = store.add(make_job("batch_archived"))
+    job.state = JobState.COMPLETED
+    job.collection_state = CollectionState.UNAVAILABLE
+    store.update(job)
+
+    assert not store.get("batch_archived").is_actionable
+    assert store.actionable() == []
 
 
 def test_v04_manifest_migrates_conservatively(tmp_path):
@@ -136,7 +158,7 @@ def test_v04_manifest_migrates_conservatively(tmp_path):
 
     store = JobStore(path)
 
-    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 2
     assert store.get("active").collection_state == CollectionState.NOT_READY
     assert store.get("with_files").collection_state == CollectionState.COLLECTED
     assert store.get("missing_files").collection_state == CollectionState.PENDING
@@ -144,6 +166,10 @@ def test_v04_manifest_migrates_conservatively(tmp_path):
         "active",
         "missing_files",
     ]
+    anthropic = make_job("active")
+    anthropic.provider = "anthropic"
+    store.add(anthropic)
+    assert store.get("active", provider="anthropic") is not None
     store.close()
 
 

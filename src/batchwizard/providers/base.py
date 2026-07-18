@@ -4,17 +4,28 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from ..models import BatchStatus, DownloadedResults, ProviderJobSummary
+from ..models import (
+    BatchStatus,
+    DownloadedResults,
+    ProviderJobSummary,
+    SubmittedBatch,
+)
+
+
+class ArtifactUnavailableError(RuntimeError):
+    """Provider artifacts have been permanently removed or archived."""
 
 
 @runtime_checkable
 class BatchProvider(Protocol):
-    """A provider that can run batch jobs (OpenAI today; Anthropic/Gemini later)."""
+    """A provider adapter for durable, provider-native batch jobs."""
 
     name: str
 
-    async def submit(self, input_file: Path, endpoint: str) -> str:
-        """Upload the input file and create a batch. Returns the provider batch ID."""
+    async def submit(
+        self, input_file: Path, endpoint: str | None = None
+    ) -> SubmittedBatch:
+        """Validate provider-native input and create a batch."""
         ...
 
     async def status(self, batch_id: str) -> BatchStatus:

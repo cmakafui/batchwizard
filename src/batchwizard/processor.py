@@ -14,7 +14,7 @@ from .models import (
     CollectionState,
     JobRecord,
 )
-from .providers.base import BatchProvider
+from .providers.base import ArtifactUnavailableError, BatchProvider
 from .store import JobStore
 from .utils import discover_jsonl
 
@@ -54,7 +54,7 @@ class BatchOrchestrator:
             self.on_event(JobEvent(kind=kind, job=job, message=message))
 
     async def submit_paths(
-        self, input_paths: list[Path], endpoint: str = "/v1/chat/completions"
+        self, input_paths: list[Path], endpoint: str | None = None
     ) -> list[JobRecord]:
         """Upload inputs, create batches, and record them in the manifest."""
         files = discover_jsonl(input_paths)
@@ -67,7 +67,7 @@ class BatchOrchestrator:
         async def submit_one(input_file: Path) -> JobRecord | None:
             async with semaphore:
                 try:
-                    batch_id = await self.provider.submit(input_file, endpoint)
+                    submitted = await self.provider.submit(input_file, endpoint)
                 except Exception as e:
                     logger.error(f"Failed to submit {input_file.name}: {e}")
                     self._emit(
@@ -77,9 +77,10 @@ class BatchOrchestrator:
             job = self.store.add(
                 JobRecord(
                     provider=self.provider.name,
-                    batch_id=batch_id,
+                    batch_id=submitted.batch_id,
                     input_path=str(input_file),
-                    endpoint=endpoint,
+                    endpoint=submitted.endpoint,
+                    provider_status=submitted.provider_status,
                 )
             )
             self._emit("submitted", job)
@@ -159,7 +160,10 @@ class BatchOrchestrator:
         job.error_summary = status.error_summary
         job.last_local_error = None
         job.poll_failures = 0
-        if status.is_terminal and job.collection_state != CollectionState.COLLECTED:
+        if status.is_terminal and job.collection_state in {
+            CollectionState.NOT_READY,
+            CollectionState.FAILED,
+        }:
             job.collection_state = CollectionState.PENDING
 
     async def collect(self, job: JobRecord, output_dir: Path) -> JobRecord:
@@ -168,6 +172,14 @@ class BatchOrchestrator:
             raise ValueError(f"Cannot collect non-terminal job {job.batch_id}")
         try:
             results = await self.provider.fetch_results(job.batch_id, output_dir)
+        except ArtifactUnavailableError as e:
+            job.collection_state = CollectionState.UNAVAILABLE
+            job.error_summary = str(e)
+            job.last_local_error = None
+            self.store.update(job)
+            logger.warning(f"Artifacts unavailable for {job.batch_id}: {e}")
+            self._emit("finished", job, message=str(e))
+            return job
         except Exception as e:
             job.collection_state = CollectionState.FAILED
             job.last_local_error = f"Artifact collection failed: {e}"
@@ -179,6 +191,8 @@ class BatchOrchestrator:
         job.output_path = str(results.output_path) if results.output_path else None
         job.error_path = str(results.error_path) if results.error_path else None
         job.collection_state = CollectionState.COLLECTED
+        if results.error_summary:
+            job.error_summary = results.error_summary
         job.last_local_error = None
         self.store.update(job)
         self._emit("finished", job)
@@ -187,7 +201,7 @@ class BatchOrchestrator:
     async def request_cancel(self, batch_id: str) -> BatchStatus:
         """Request cancellation without pretending it has already completed."""
         status = await self.provider.cancel(batch_id)
-        job = self.store.get(batch_id)
+        job = self.store.get(batch_id, provider=self.provider.name)
         if job:
             self._apply_status(job, status)
             self.store.update(job)
@@ -198,7 +212,7 @@ class BatchOrchestrator:
         self,
         input_paths: list[Path],
         output_dir: Path,
-        endpoint: str = "/v1/chat/completions",
+        endpoint: str | None = None,
     ) -> list[JobRecord]:
         """Submit and then watch to completion (the classic blocking flow)."""
         jobs = await self.submit_paths(input_paths, endpoint)

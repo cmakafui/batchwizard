@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from loguru import logger
@@ -14,7 +15,10 @@ from ..models import (
     DownloadedResults,
     JobState,
     ProviderJobSummary,
+    SubmittedBatch,
 )
+
+DEFAULT_ENDPOINT = "/v1/chat/completions"
 
 SUPPORTED_ENDPOINTS = frozenset(
     {
@@ -61,9 +65,12 @@ class OpenAIBatchProvider:
     name = "openai"
 
     def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(api_key=config.get_api_key())
+        self.client = client or AsyncOpenAI(api_key=config.get_api_key("openai"))
 
-    async def submit(self, input_file: Path, endpoint: str) -> str:
+    async def submit(
+        self, input_file: Path, endpoint: str | None = None
+    ) -> SubmittedBatch:
+        endpoint = endpoint or DEFAULT_ENDPOINT
         if endpoint not in SUPPORTED_ENDPOINTS:
             available = ", ".join(sorted(SUPPORTED_ENDPOINTS))
             raise ValueError(
@@ -77,7 +84,11 @@ class OpenAIBatchProvider:
             completion_window="24h",
         )
         logger.info(f"Submitted {input_file.name} as batch {batch.id}")
-        return batch.id
+        return SubmittedBatch(
+            batch_id=batch.id,
+            provider_status=str(batch.status).lower(),
+            endpoint=endpoint,
+        )
 
     async def status(self, batch_id: str) -> BatchStatus:
         batch = await self.client.batches.retrieve(batch_id)
@@ -131,7 +142,11 @@ class OpenAIBatchProvider:
                 ProviderJobSummary(
                     batch_id=batch.id,
                     provider_status=batch.status,
-                    created_at=getattr(batch, "created_at", None),
+                    created_at=(
+                        datetime.fromtimestamp(batch.created_at, UTC)
+                        if getattr(batch, "created_at", None) is not None
+                        else None
+                    ),
                     completed_count=getattr(counts, "completed", 0) or 0,
                     failed_count=getattr(counts, "failed", 0) or 0,
                     total_count=getattr(counts, "total", 0) or 0,

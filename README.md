@@ -1,6 +1,10 @@
 # BatchWizard
 
-BatchWizard is a durable CLI control plane for asynchronous LLM work. Submit OpenAI Batch API jobs, exit safely, and return later to inspect their remote state and collect their result and error artifacts. Its provider-neutral manifest and orchestration layer are designed to support additional batch providers without flattening their native request formats.
+BatchWizard is a durable CLI control plane for asynchronous LLM work across
+OpenAI and Anthropic. Submit provider-native batch files, exit safely, and return
+later to inspect remote state and collect result and error artifacts. One local
+manifest and one `watch` command coordinate both providers without translating
+away their native request formats.
 
 ![image](https://github.com/user-attachments/assets/8084afbd-fd05-43b3-b57c-2ea1eb70a457)
 
@@ -66,6 +70,26 @@ submission endpoint:
 batchwizard submit batchinput.jsonl --endpoint /v1/responses
 ```
 
+Anthropic uses its native Message Batches format. Each line contains a unique
+`custom_id` and the same `params` object used by the Messages API:
+
+```jsonl
+{"custom_id":"request-1","params":{"model":"claude-opus-4-8","max_tokens":256,"messages":[{"role":"user","content":"Classify this support ticket as billing, technical, or other."}]}}
+```
+
+```bash
+batchwizard configure --provider anthropic --set-key "$ANTHROPIC_API_KEY"
+batchwizard submit --provider anthropic anthropic-batch.jsonl
+```
+
+Anthropic input is validated for the batch envelope, unique IDs, documented
+batch-only restrictions, 100,000-request limit, and 256 MB request limit before
+anything is submitted. Detailed Messages parameter validation remains
+provider-side and appears in the per-request error file.
+
+See [Anthropic Message Batches](docs/anthropic.md) for validation, lifecycle,
+result routing, cancellation, and retention details.
+
 To process this file using BatchWizard:
 
 1. First, ensure your OpenAI API key is set:
@@ -102,9 +126,10 @@ Submitted jobs are recorded in a local manifest (SQLite, in the BatchWizard conf
 batchwizard watch [--output-directory OUTPUT_DIR]
 ```
 
-`watch` picks up every actionable job from the manifest. It polls active remote
-jobs and retries artifact collection for terminal jobs whose previous download
-failed.
+`watch` groups actionable jobs by their recorded provider, polls OpenAI and
+Anthropic concurrently, and retries artifact collection for terminal jobs whose
+previous download failed. A missing key for one provider does not stop jobs for
+another provider.
 
 ### Check Tracked Jobs
 
@@ -121,29 +146,36 @@ connectivity errors are reported separately.
 BatchWizard never marks a provider batch as failed merely because the local
 machine lost contact with it. It also does not treat provider completion as proof
 that result files were collected successfully. Failed downloads remain actionable
-and are retried on the next `watch`.
+and are retried on the next `watch`. Artifacts permanently removed after a
+provider retention window are marked `unavailable` rather than retried forever.
 
 See [Job lifecycle](docs/job-lifecycle.md) for the state model, recovery invariants,
 provider contract, and manifest migration behavior.
 
 ### Failure Reasons and Error Files
 
-When a batch fails, BatchWizard surfaces the provider's actual error (e.g. `insufficient_funds`, `invalid_request` with the offending line). When individual requests inside a batch fail, the per-request error file is downloaded alongside the results as `<batch_id>_errors.jsonl`.
+When a batch fails, BatchWizard surfaces the provider's actual error. Individual
+request failures, cancellations, and expirations remain separate row outcomes.
+Anthropic's unordered streamed results are normalized into
+`<batch_id>_results.jsonl` and `<batch_id>_errors.jsonl`, preserving every native
+result object and its `custom_id`.
 
 ### Batch Endpoints
 
-By default requests go to `/v1/chat/completions` for backward compatibility. Use
+OpenAI requests go to `/v1/chat/completions` by default for backward compatibility. Use
 `--endpoint` on `process`/`submit` for `/v1/responses`, `/v1/embeddings`,
 `/v1/completions`, `/v1/moderations`, `/v1/images/generations`,
 `/v1/images/edits`, or `/v1/videos`. Every line's `url` must match the selected
-batch endpoint.
+batch endpoint. `--endpoint` is OpenAI-specific; Anthropic models and Messages
+parameters live in each native JSONL row.
 
 ### List Recent Jobs
 
 To list recent batch jobs from the provider:
 
 ```bash
-batchwizard list-jobs [--limit NUM]
+batchwizard list-jobs --provider openai [--limit NUM]
+batchwizard list-jobs --provider anthropic [--limit NUM]
 ```
 
 ### Cancel a Job
@@ -166,20 +198,25 @@ This downloads the results file and, if any requests failed, the per-request err
 
 ## Configuration
 
-### Setting up the OpenAI API Key
+### Setting up provider API keys
 
-To set the OpenAI API key:
+Set either provider key explicitly:
 
 ```bash
-batchwizard configure --set-key YOUR_API_KEY
+batchwizard configure --provider openai --set-key YOUR_OPENAI_API_KEY
+batchwizard configure --provider anthropic --set-key YOUR_ANTHROPIC_API_KEY
 ```
+
+`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are also read from the environment.
+Stored configuration is replaced atomically with owner-only file permissions.
 
 ### Show Current Configuration
 
 To show the current configuration:
 
 ```bash
-batchwizard configure --show
+batchwizard configure --provider openai --show
+batchwizard configure --provider anthropic --show
 ```
 
 ### Reset Configuration
@@ -218,6 +255,8 @@ batchwizard <command> --help
 - **Job Management**: List, cancel, and download results for batch jobs.
 - **Durable Recovery**: Preserve remote truth across local connectivity and artifact-download failures.
 - **Responses API**: Submit modern `/v1/responses` JSONL batches alongside other OpenAI batch endpoints.
+- **Anthropic Message Batches**: Use the GA async SDK surface with native input, mixed outcomes, streamed results, and honest cancellation.
+- **Mixed-provider Watch**: Reattach to OpenAI and Anthropic work together after process exit or reboot.
 
 ## Contributing
 

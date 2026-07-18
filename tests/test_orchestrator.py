@@ -7,8 +7,10 @@ from batchwizard.models import (
     CollectionState,
     DownloadedResults,
     JobState,
+    SubmittedBatch,
 )
 from batchwizard.processor import BatchOrchestrator
+from batchwizard.providers.base import ArtifactUnavailableError
 from batchwizard.store import JobStore
 from batchwizard.utils import discover_jsonl
 
@@ -22,19 +24,25 @@ class FakeProvider:
         self.counter = 0
         self.status_scripts: dict[str, list[BatchStatus]] = {}
         self.files: dict[str, DownloadedResults] = {}
-        self.submitted: list[tuple[Path, str]] = []
+        self.submitted: list[tuple[Path, str | None]] = []
         self.fail_submit_for: set[str] = set()
         self.fetch_failures: dict[str, int] = {}
         self.cancel_status = BatchStatus(
             provider_status="cancelling", state=JobState.CANCELLING
         )
 
-    async def submit(self, input_file: Path, endpoint: str) -> str:
+    async def submit(
+        self, input_file: Path, endpoint: str | None = None
+    ) -> SubmittedBatch:
         if input_file.name in self.fail_submit_for:
             raise RuntimeError("upload exploded")
         self.submitted.append((input_file, endpoint))
         self.counter += 1
-        return f"batch_{self.counter}"
+        return SubmittedBatch(
+            batch_id=f"batch_{self.counter}",
+            provider_status="validating",
+            endpoint=endpoint or "/v1/chat/completions",
+        )
 
     async def status(self, batch_id: str) -> BatchStatus:
         script = self.status_scripts[batch_id]
@@ -304,6 +312,31 @@ async def test_terminal_job_with_no_provider_files_is_still_fully_collected(
     assert finished.output_path is None
     assert finished.error_path is None
     assert not finished.is_actionable
+
+
+async def test_permanently_unavailable_artifacts_do_not_retry_forever(
+    store: JobStore, jsonl_dir: Path, tmp_path: Path
+):
+    class ArchivedProvider(FakeProvider):
+        async def fetch_results(self, batch_id, output_dir):
+            raise ArtifactUnavailableError("provider retention window elapsed")
+
+    provider = ArchivedProvider()
+    provider.status_scripts = {"batch_1": [done()]}
+    orchestrator = BatchOrchestrator(provider, store, check_interval=0)
+    jobs = await orchestrator.submit_paths([jsonl_dir / "a.jsonl"])
+
+    finished = (await orchestrator.watch(jobs, tmp_path / "out"))[0]
+
+    assert finished.state == JobState.COMPLETED
+    assert finished.collection_state == CollectionState.UNAVAILABLE
+    assert finished.error_summary == "provider retention window elapsed"
+    assert not finished.is_actionable
+    assert store.actionable() == []
+
+    # A later status refresh must not turn permanent retention loss retryable again.
+    orchestrator._apply_status(finished, done())
+    assert finished.collection_state == CollectionState.UNAVAILABLE
 
 
 async def test_events_are_emitted_in_order(store: JobStore, jsonl_dir: Path, tmp_path):

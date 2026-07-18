@@ -73,8 +73,8 @@ async def test_real_sdk_supports_responses_and_preserves_future_status(
     )
 
     try:
-        batch_id = await provider.submit(input_file, "/v1/responses")
-        status = await provider.status(batch_id)
+        submitted = await provider.submit(input_file, "/v1/responses")
+        status = await provider.status(submitted.batch_id)
     finally:
         await provider.close()
 

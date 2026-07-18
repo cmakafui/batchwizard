@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from collections import defaultdict
 from pathlib import Path
 
 import typer
@@ -11,25 +11,46 @@ from rich.table import Table
 
 from .config import BatchWizardSettings, config
 from .models import TERMINAL_STATES, CollectionState
-from .processor import BatchOrchestrator
-from .providers import get_provider
-from .store import JobStore
+from .processor import BatchOrchestrator, JobEvent
+from .providers import available_providers, get_provider
+from .store import AmbiguousJobError, JobStore
 from .ui import Dashboard
 from .utils import get_api_key, set_api_key, setup_logger
 
-app = typer.Typer(help="BatchWizard: Manage LLM batch processing jobs with ease")
+app = typer.Typer(
+    help="BatchWizard: Manage durable batch jobs across OpenAI and Anthropic"
+)
 console = Console()
 logger = setup_logger(console)
 
-DEFAULT_ENDPOINT = "/v1/chat/completions"
+
+def _validate_provider(provider: str) -> str:
+    if provider not in available_providers():
+        available = ", ".join(available_providers())
+        raise typer.BadParameter(
+            f"Unknown provider {provider!r}. Available: {available}",
+            param_hint="provider",
+        )
+    return provider
 
 
-def _require_api_key() -> None:
-    if not get_api_key():
+def _require_api_key(provider: str) -> None:
+    _validate_provider(provider)
+    if not get_api_key(provider):
         logger.error(
-            "API key not set. Please set it using 'batchwizard configure --set-key YOUR_API_KEY'"
+            f"{provider.title()} API key not set. Configure it with "
+            f"'batchwizard configure --provider {provider} --set-key YOUR_API_KEY'"
         )
         raise typer.Exit(code=1)
+
+
+def _validate_submission_options(provider: str, endpoint: str | None) -> None:
+    _validate_provider(provider)
+    if provider != "openai" and endpoint is not None:
+        raise typer.BadParameter(
+            "--endpoint is OpenAI-specific and cannot be used with Anthropic",
+            param_hint="endpoint",
+        )
 
 
 def _default_output_dir(output_directory: Path | None) -> Path:
@@ -47,14 +68,29 @@ def _print_submitted(jobs) -> None:
         console.print("[yellow]Nothing submitted.[/yellow]")
         return
     table = Table(title="Submitted Batches")
+    table.add_column("Provider", style="blue")
     table.add_column("Batch ID", style="cyan")
     table.add_column("Input", style="green")
     for job in jobs:
-        table.add_row(job.batch_id, job.input_path)
+        table.add_row(job.provider, job.batch_id, job.input_path)
     console.print(table)
     console.print(
         "Run [bold]batchwizard watch[/bold] any time to poll and download results."
     )
+
+
+def _request_summary(job) -> str:
+    if not job.total_count:
+        return ""
+    parts = [f"{job.completed_count} ok"]
+    for count, label in (
+        (job.failed_count, "failed"),
+        (job.cancelled_count, "cancelled"),
+        (job.expired_count, "expired"),
+    ):
+        if count:
+            parts.append(f"{count} {label}")
+    return " / ".join(parts)
 
 
 @app.command()
@@ -71,8 +107,11 @@ def process(
     check_interval: int = typer.Option(
         5, help="Initial interval (in seconds) between job status checks"
     ),
-    endpoint: str = typer.Option(
-        DEFAULT_ENDPOINT,
+    provider: str = typer.Option(
+        "openai", "--provider", help="Batch provider: openai or anthropic"
+    ),
+    endpoint: str | None = typer.Option(
+        None,
         help="Batch endpoint (e.g. /v1/chat/completions, /v1/responses, /v1/embeddings)",
     ),
     submit_only: bool = typer.Option(
@@ -82,19 +121,20 @@ def process(
     ),
 ):
     """Process batch jobs from input files or directories."""
-    _require_api_key()
+    _validate_submission_options(provider, endpoint)
+    _require_api_key(provider)
     output_dir = _default_output_dir(output_directory)
-    provider = get_provider()
+    batch_provider = get_provider(provider)
     store = JobStore(config.db_file)
 
     if submit_only:
 
         async def submit():
-            orchestrator = BatchOrchestrator(provider, store)
+            orchestrator = BatchOrchestrator(batch_provider, store)
             try:
                 return await orchestrator.submit_paths(input_paths, endpoint)
             finally:
-                await provider.close()
+                await batch_provider.close()
 
         _print_submitted(asyncio.run(submit()))
         return
@@ -103,7 +143,7 @@ def process(
 
     async def run():
         orchestrator = BatchOrchestrator(
-            provider,
+            batch_provider,
             store,
             on_event=dashboard.on_event,
             check_interval=check_interval,
@@ -113,7 +153,7 @@ def process(
             with dashboard:
                 await orchestrator.process(input_paths, output_dir, endpoint)
         finally:
-            await provider.close()
+            await batch_provider.close()
 
     _run(run())
     dashboard.print_summary()
@@ -124,19 +164,23 @@ def submit(
     input_paths: list[Path] = typer.Argument(
         ..., help="Paths to input files or directories to submit"
     ),
-    endpoint: str = typer.Option(DEFAULT_ENDPOINT, help="Batch endpoint"),
+    provider: str = typer.Option(
+        "openai", "--provider", help="Batch provider: openai or anthropic"
+    ),
+    endpoint: str | None = typer.Option(None, help="OpenAI Batch endpoint"),
 ):
     """Submit batch jobs and exit immediately (use 'watch' to collect results later)."""
-    _require_api_key()
-    provider = get_provider()
+    _validate_submission_options(provider, endpoint)
+    _require_api_key(provider)
+    batch_provider = get_provider(provider)
     store = JobStore(config.db_file)
 
     async def run():
-        orchestrator = BatchOrchestrator(provider, store)
+        orchestrator = BatchOrchestrator(batch_provider, store)
         try:
             return await orchestrator.submit_paths(input_paths, endpoint)
         finally:
-            await provider.close()
+            await batch_provider.close()
 
     _print_submitted(asyncio.run(run()))
 
@@ -151,28 +195,57 @@ def watch(
     ),
 ):
     """Advance remote jobs and retry any uncollected terminal artifacts."""
-    _require_api_key()
     output_dir = _default_output_dir(output_directory)
     store = JobStore(config.db_file)
     actionable = store.actionable()
     if not actionable:
         console.print("[yellow]No actionable jobs in the manifest.[/yellow]")
         return
-    provider = get_provider()
-
     dashboard = Dashboard(Console(), title="BatchWizard Watch")
     for job in actionable:  # seed the table before polling starts
-        dashboard.jobs[job.batch_id] = job
+        dashboard.jobs[(job.provider, job.batch_id)] = job
 
     async def run():
-        orchestrator = BatchOrchestrator(
-            provider, store, on_event=dashboard.on_event, check_interval=check_interval
-        )
-        try:
-            with dashboard:
-                await orchestrator.watch(actionable, output_dir)
-        finally:
-            await provider.close()
+        groups: dict[str, list] = defaultdict(list)
+        for job in actionable:
+            groups[job.provider].append(job)
+
+        async def watch_provider(provider_name: str, jobs: list) -> None:
+            if provider_name not in available_providers():
+                message = f"Provider {provider_name!r} is not installed"
+                for job in jobs:
+                    job.last_local_error = message
+                    store.update(job)
+                    dashboard.on_event(
+                        JobEvent(kind="attention", job=job, message=message)
+                    )
+                return
+            if not get_api_key(provider_name):
+                message = f"Missing {provider_name.upper()} API key; configure it and rerun watch"
+                for job in jobs:
+                    job.last_local_error = message
+                    store.update(job)
+                    dashboard.on_event(
+                        JobEvent(kind="attention", job=job, message=message)
+                    )
+                return
+
+            batch_provider = get_provider(provider_name)
+            orchestrator = BatchOrchestrator(
+                batch_provider,
+                store,
+                on_event=dashboard.on_event,
+                check_interval=check_interval,
+            )
+            try:
+                await orchestrator.watch(jobs, output_dir)
+            finally:
+                await batch_provider.close()
+
+        with dashboard:
+            await asyncio.gather(
+                *(watch_provider(name, jobs) for name, jobs in groups.items())
+            )
 
     _run(run())
     dashboard.print_summary()
@@ -205,11 +278,7 @@ def status(
             job.batch_id,
             job.provider_status or job.state,
             job.collection_state,
-            (
-                f"{job.completed_count} ok / {job.failed_count} failed"
-                if job.total_count
-                else ""
-            ),
+            _request_summary(job),
             Path(job.input_path).name,
             job.updated_at,
             job.last_local_error or job.error_summary or "",
@@ -220,21 +289,23 @@ def status(
 @app.command()
 def configure(
     set_key: str | None = typer.Option(
-        None, "--set-key", help="Set the OpenAI API key"
+        None, "--set-key", help="Set an API key for the selected provider"
     ),
+    provider: str = typer.Option("openai", "--provider", help="API provider"),
     show: bool = typer.Option(False, "--show", help="Show the current configuration"),
     reset: bool = typer.Option(
         False, "--reset", help="Reset the configuration to default values"
     ),
 ):
     """Manage BatchWizard configuration."""
+    _validate_provider(provider)
     if set_key:
-        set_api_key(set_key)
-        console.print("[green]API key set successfully.[/green]")
+        set_api_key(set_key, provider)
+        console.print(f"[green]{provider.title()} API key set successfully.[/green]")
     elif show:
-        api_key = get_api_key()
+        api_key = get_api_key(provider)
         masked_key = f"{api_key[:4]}...{api_key[-4:]}" if api_key else "Not set"
-        console.print(f"API Key: {masked_key}")
+        console.print(f"{provider.title()} API Key: {masked_key}")
         console.print(f"Max Concurrent Jobs: {config.settings.max_concurrent_jobs}")
         console.print(f"Check Interval: {config.settings.check_interval} seconds")
         console.print(f"Job manifest: {config.db_file}")
@@ -251,23 +322,23 @@ def configure(
 @app.command()
 def list_jobs(
     limit: int = typer.Option(20, help="Number of jobs to display"),
+    provider: str = typer.Option("openai", "--provider", help="Batch provider"),
 ):
     """List recent batch jobs from the provider (not the local manifest)."""
-    _require_api_key()
-    provider = get_provider()
+    _require_api_key(provider)
+    batch_provider = get_provider(provider)
 
     async def fetch_jobs():
         try:
-            jobs = await provider.list_jobs(limit=limit)
-            table = Table(title="Batch Jobs (provider)")
+            jobs = await batch_provider.list_jobs(limit=limit)
+            table = Table(title=f"Batch Jobs ({provider})")
             table.add_column("Job ID", style="cyan")
             table.add_column("Status", style="magenta")
             table.add_column("Created At", style="green")
-            table.add_column("Completed", style="blue")
-            table.add_column("Failed", style="red")
+            table.add_column("Requests")
             for job in jobs:
                 created_at = (
-                    datetime.fromtimestamp(job.created_at).strftime("%Y-%m-%d %H:%M:%S")
+                    job.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                     if job.created_at is not None
                     else ""
                 )
@@ -275,12 +346,11 @@ def list_jobs(
                     job.batch_id,
                     job.provider_status,
                     created_at,
-                    str(job.completed_count),
-                    str(job.failed_count),
+                    _request_summary(job),
                 )
             console.print(table)
         finally:
-            await provider.close()
+            await batch_provider.close()
 
     _run(fetch_jobs())
 
@@ -288,15 +358,24 @@ def list_jobs(
 @app.command()
 def cancel(
     job_id: str = typer.Argument(..., help="ID of the batch job to cancel"),
+    provider: str | None = typer.Option(
+        None, "--provider", help="Provider (inferred for tracked jobs)"
+    ),
 ):
     """Cancel a specific batch job."""
-    _require_api_key()
-    provider = get_provider()
     store = JobStore(config.db_file)
+    try:
+        tracked = store.get(job_id, provider=provider)
+    except AmbiguousJobError as error:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(code=2) from error
+    provider_name = provider or (tracked.provider if tracked else "openai")
+    _require_api_key(provider_name)
+    batch_provider = get_provider(provider_name)
 
     async def cancel_job():
         try:
-            orchestrator = BatchOrchestrator(provider, store)
+            orchestrator = BatchOrchestrator(batch_provider, store)
             status = await orchestrator.request_cancel(job_id)
             console.print(
                 f"[green]Cancellation requested for {job_id} "
@@ -305,7 +384,7 @@ def cancel(
         except Exception as e:
             console.print(f"[red]Error cancelling job {job_id}: {e}[/red]")
         finally:
-            await provider.close()
+            await batch_provider.close()
 
     _run(cancel_job())
 
@@ -318,26 +397,38 @@ def download(
     output_directory: Path | None = typer.Option(
         None, help="Directory to store output files"
     ),
+    provider: str | None = typer.Option(
+        None, "--provider", help="Provider (inferred for tracked jobs)"
+    ),
 ):
     """Download results (and error file, if any) for a batch job."""
-    _require_api_key()
     output_dir = _default_output_dir(output_directory)
-    provider = get_provider()
     store = JobStore(config.db_file)
+    try:
+        tracked = store.get(job_id, provider=provider)
+    except AmbiguousJobError as error:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(code=2) from error
+    provider_name = provider or (tracked.provider if tracked else "openai")
+    _require_api_key(provider_name)
+    batch_provider = get_provider(provider_name)
 
     async def download_results():
         try:
-            job = store.get(job_id)
+            job = tracked
             if job and job.state in TERMINAL_STATES:
-                orchestrator = BatchOrchestrator(provider, store)
+                orchestrator = BatchOrchestrator(batch_provider, store)
                 job = await orchestrator.collect(job, output_dir)
                 if job.collection_state == CollectionState.FAILED:
                     console.print(f"[red]{job.last_local_error}[/red]")
                     return
+                if job.collection_state == CollectionState.UNAVAILABLE:
+                    console.print(f"[magenta]{job.error_summary}[/magenta]")
+                    return
                 output_path = job.output_path
                 error_path = job.error_path
             else:
-                results = await provider.fetch_results(job_id, output_dir)
+                results = await batch_provider.fetch_results(job_id, output_dir)
                 output_path = str(results.output_path) if results.output_path else None
                 error_path = str(results.error_path) if results.error_path else None
             if output_path:
@@ -347,7 +438,7 @@ def download(
                     f"[yellow]Per-request errors saved to {error_path}[/yellow]"
                 )
             if not output_path and not error_path:
-                status = await provider.status(job_id)
+                status = await batch_provider.status(job_id)
                 console.print(
                     f"[yellow]No files available for {job_id} "
                     f"(status: {status.provider_status}).[/yellow]"
@@ -357,7 +448,7 @@ def download(
         except Exception as e:
             console.print(f"[red]Error downloading results for {job_id}: {e}[/red]")
         finally:
-            await provider.close()
+            await batch_provider.close()
 
     _run(download_results())
 

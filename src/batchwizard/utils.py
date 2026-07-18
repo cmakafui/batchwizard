@@ -35,14 +35,14 @@ def setup_logger(console: Console = None):
     return logger
 
 
-def get_api_key() -> str | None:
+def get_api_key(provider: str = "openai") -> str | None:
     """Get the API key from config or environment variable."""
-    return config.get_api_key()
+    return config.get_api_key(provider)
 
 
-def set_api_key(api_key: str) -> None:
+def set_api_key(api_key: str, provider: str = "openai") -> None:
     """Set the API key in the config."""
-    config.set_api_key(api_key)
+    config.set_api_key(api_key, provider)
 
 
 def get_settings():
