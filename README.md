@@ -5,8 +5,8 @@ provider-native JSONL, close the terminal, and come back later: a local SQLite
 manifest remembers what is running, what still needs to be downloaded, and what
 needs your attention.
 
-It deliberately does not translate prompts between APIs. OpenAI and Anthropic
-have different request formats and capabilities; BatchWizard gives them one
+It does not translate prompts between APIs. OpenAI and Anthropic have
+different request formats and capabilities; BatchWizard gives them one
 operational lifecycle without pretending they are the same protocol.
 
 ## Quickstart
@@ -39,7 +39,7 @@ batchwizard watch --output-directory ./results
 batchwizard status --all
 ```
 
-`watch` is intentionally provider-free. The manifest records which adapter owns
+`watch` is provider-free. The manifest records which adapter owns
 each batch, so a single invocation can resume a mixture of OpenAI and Anthropic
 jobs. Missing credentials or a temporary download failure for one provider do
 not erase work or prevent other provider groups from advancing.

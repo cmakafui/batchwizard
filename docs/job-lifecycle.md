@@ -6,7 +6,7 @@ and local artifacts can be inspected independently.
 
 ## State dimensions
 
-`JobRecord` deliberately records four different concerns:
+`JobRecord` records four different concerns:
 
 | Concern | Manifest fields | Meaning |
 | --- | --- | --- |
