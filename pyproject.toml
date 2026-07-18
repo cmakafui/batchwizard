@@ -69,10 +69,6 @@ select = [
 ]
 ignore = ["E501"]
 
-[tool.ruff.lint.per-file-ignores]
-# Typer declares CLI params via function-call defaults by design
-"src/batchwizard/cli.py" = ["B008"]
-
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"

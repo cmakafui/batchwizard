@@ -5,6 +5,7 @@ import asyncio
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -18,9 +19,7 @@ from .store import AmbiguousJobError, JobStore
 from .ui import Dashboard
 from .utils import get_api_key, set_api_key, setup_logger
 
-app = typer.Typer(
-    help="BatchWizard: Manage durable batch jobs across OpenAI and Anthropic"
-)
+app = typer.Typer(help="Manage LLM batch jobs across OpenAI and Anthropic")
 console = Console()
 logger = setup_logger(console)
 
@@ -131,34 +130,39 @@ def _request_summary(job) -> str:
 
 @app.command()
 def process(
-    input_paths: list[Path] = typer.Argument(
-        ..., help="Paths to input files or directories for processing"
-    ),
-    output_directory: Path | None = typer.Option(
-        None, help="Directory to store output files"
-    ),
-    max_concurrent_jobs: int = typer.Option(
-        DEFAULT_MAX_CONCURRENT_JOBS,
-        min=1,
-        help="Maximum number of concurrent jobs",
-    ),
-    check_interval: int = typer.Option(
-        DEFAULT_CHECK_INTERVAL,
-        min=0,
-        help="Initial interval (in seconds) between job status checks",
-    ),
-    provider: str = typer.Option(
-        "openai", "--provider", help="Batch provider: openai or anthropic"
-    ),
-    endpoint: str | None = typer.Option(
-        None,
-        help="Batch endpoint (e.g. /v1/chat/completions, /v1/responses, /v1/embeddings)",
-    ),
-    submit_only: bool = typer.Option(
-        False,
-        "--submit-only",
-        help="Submit the batches and exit without waiting for completion",
-    ),
+    input_paths: Annotated[
+        list[Path],
+        typer.Argument(help="Paths to input files or directories for processing"),
+    ],
+    output_directory: Annotated[
+        Path | None, typer.Option(help="Directory to store output files")
+    ] = None,
+    max_concurrent_jobs: Annotated[
+        int, typer.Option(min=1, help="Maximum number of concurrent jobs")
+    ] = DEFAULT_MAX_CONCURRENT_JOBS,
+    check_interval: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Initial interval (in seconds) between job status checks",
+        ),
+    ] = DEFAULT_CHECK_INTERVAL,
+    provider: Annotated[
+        str, typer.Option("--provider", help="Batch provider: openai or anthropic")
+    ] = "openai",
+    endpoint: Annotated[
+        str | None,
+        typer.Option(
+            help="Batch endpoint (e.g. /v1/chat/completions, /v1/responses, /v1/embeddings)"
+        ),
+    ] = None,
+    submit_only: Annotated[
+        bool,
+        typer.Option(
+            "--submit-only",
+            help="Submit the batches and exit without waiting for completion",
+        ),
+    ] = False,
 ):
     """Process batch jobs from input files or directories."""
     _validate_submission_options(provider, endpoint)
@@ -203,18 +207,17 @@ def process(
 
 @app.command()
 def submit(
-    input_paths: list[Path] = typer.Argument(
-        ..., help="Paths to input files or directories to submit"
-    ),
-    provider: str = typer.Option(
-        "openai", "--provider", help="Batch provider: openai or anthropic"
-    ),
-    endpoint: str | None = typer.Option(None, help="OpenAI Batch endpoint"),
-    max_concurrent_jobs: int = typer.Option(
-        DEFAULT_MAX_CONCURRENT_JOBS,
-        min=1,
-        help="Maximum number of concurrent submissions",
-    ),
+    input_paths: Annotated[
+        list[Path], typer.Argument(help="Paths to input files or directories to submit")
+    ],
+    provider: Annotated[
+        str, typer.Option("--provider", help="Batch provider: openai or anthropic")
+    ] = "openai",
+    endpoint: Annotated[str | None, typer.Option(help="OpenAI Batch endpoint")] = None,
+    max_concurrent_jobs: Annotated[
+        int,
+        typer.Option(min=1, help="Maximum number of concurrent submissions"),
+    ] = DEFAULT_MAX_CONCURRENT_JOBS,
 ):
     """Submit batch jobs and exit immediately (use 'watch' to collect results later)."""
     _validate_submission_options(provider, endpoint)
@@ -236,19 +239,23 @@ def submit(
 
 @app.command()
 def watch(
-    output_directory: Path | None = typer.Option(
-        None, help="Directory to store output files"
-    ),
-    check_interval: int = typer.Option(
-        DEFAULT_CHECK_INTERVAL,
-        min=0,
-        help="Initial interval (in seconds) between job status checks",
-    ),
-    max_concurrent_jobs: int = typer.Option(
-        DEFAULT_MAX_CONCURRENT_JOBS,
-        min=1,
-        help="Maximum number of concurrently watched jobs per provider",
-    ),
+    output_directory: Annotated[
+        Path | None, typer.Option(help="Directory to store output files")
+    ] = None,
+    check_interval: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Initial interval (in seconds) between job status checks",
+        ),
+    ] = DEFAULT_CHECK_INTERVAL,
+    max_concurrent_jobs: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Maximum number of concurrently watched jobs per provider",
+        ),
+    ] = DEFAULT_MAX_CONCURRENT_JOBS,
 ):
     """Advance remote jobs and retry any uncollected terminal artifacts."""
     output_dir = _default_output_dir(output_directory)
@@ -310,13 +317,14 @@ def watch(
 
 @app.command()
 def status(
-    all: bool = typer.Option(
-        False, "--all", help="Show all jobs (default: actionable jobs only)"
-    ),
+    all_jobs: Annotated[
+        bool,
+        typer.Option("--all", help="Show all jobs (default: actionable jobs only)"),
+    ] = False,
 ):
     """Show jobs tracked in the local manifest."""
     store = JobStore(config.db_file)
-    jobs = store.list() if all else store.actionable()
+    jobs = store.list() if all_jobs else store.actionable()
     if not jobs:
         console.print("[yellow]No jobs in the manifest.[/yellow]")
         return
@@ -345,14 +353,19 @@ def status(
 
 @app.command()
 def configure(
-    set_key: str | None = typer.Option(
-        None, "--set-key", help="Set an API key for the selected provider"
+    set_key: Annotated[
+        str | None,
+        typer.Option("--set-key", help="Set an API key for the selected provider"),
+    ] = None,
+    provider: Annotated[str, typer.Option("--provider", help="API provider")] = (
+        "openai"
     ),
-    provider: str = typer.Option("openai", "--provider", help="API provider"),
-    show: bool = typer.Option(False, "--show", help="Show the current configuration"),
-    reset: bool = typer.Option(
-        False, "--reset", help="Reset the configuration to default values"
-    ),
+    show: Annotated[
+        bool, typer.Option("--show", help="Show the current configuration")
+    ] = False,
+    reset: Annotated[
+        bool, typer.Option("--reset", help="Reset the configuration to defaults")
+    ] = False,
 ):
     """Manage BatchWizard configuration."""
     _validate_provider(provider)
@@ -378,19 +391,26 @@ def configure(
 
 @app.command()
 def reconcile(
-    intent_id: str | None = typer.Argument(
-        None, help="Submission intent to reconcile (omit to list unresolved intents)"
-    ),
-    batch_id: str | None = typer.Option(
-        None,
-        "--batch-id",
-        help="Provider batch ID when automatic metadata matching is unavailable",
-    ),
-    discard: bool = typer.Option(
-        False,
-        "--discard",
-        help="Delete an intent after confirming that no provider batch exists",
-    ),
+    intent_id: Annotated[
+        str | None,
+        typer.Argument(
+            help="Submission intent to reconcile (omit to list unresolved intents)"
+        ),
+    ] = None,
+    batch_id: Annotated[
+        str | None,
+        typer.Option(
+            "--batch-id",
+            help="Provider batch ID when automatic metadata matching is unavailable",
+        ),
+    ] = None,
+    discard: Annotated[
+        bool,
+        typer.Option(
+            "--discard",
+            help="Delete an intent after confirming that no provider batch exists",
+        ),
+    ] = False,
 ):
     """Attach an uncertain submission intent to its provider batch."""
     store = JobStore(config.db_file)
@@ -482,8 +502,10 @@ def reconcile(
 
 @app.command()
 def list_jobs(
-    limit: int = typer.Option(20, min=1, help="Number of jobs to display"),
-    provider: str = typer.Option("openai", "--provider", help="Batch provider"),
+    limit: Annotated[int, typer.Option(min=1, help="Number of jobs to display")] = 20,
+    provider: Annotated[str, typer.Option("--provider", help="Batch provider")] = (
+        "openai"
+    ),
 ):
     """List recent batch jobs from the provider (not the local manifest)."""
     _require_api_key(provider)
@@ -520,10 +542,11 @@ def list_jobs(
 
 @app.command()
 def cancel(
-    job_id: str = typer.Argument(..., help="ID of the batch job to cancel"),
-    provider: str | None = typer.Option(
-        None, "--provider", help="Provider (inferred for tracked jobs)"
-    ),
+    job_id: Annotated[str, typer.Argument(help="ID of the batch job to cancel")],
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="Provider (inferred for tracked jobs)"),
+    ] = None,
 ):
     """Cancel a specific batch job."""
     store = JobStore(config.db_file)
@@ -556,15 +579,16 @@ def cancel(
 
 @app.command()
 def download(
-    job_id: str = typer.Argument(
-        ..., help="ID of the batch job to download results for"
-    ),
-    output_directory: Path | None = typer.Option(
-        None, help="Directory to store output files"
-    ),
-    provider: str | None = typer.Option(
-        None, "--provider", help="Provider (inferred for tracked jobs)"
-    ),
+    job_id: Annotated[
+        str, typer.Argument(help="ID of the batch job to download results for")
+    ],
+    output_directory: Annotated[
+        Path | None, typer.Option(help="Directory to store output files")
+    ] = None,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="Provider (inferred for tracked jobs)"),
+    ] = None,
 ):
     """Download results (and error file, if any) for a batch job."""
     output_dir = _default_output_dir(output_directory)
