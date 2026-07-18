@@ -23,7 +23,10 @@ class BatchProvider(Protocol):
     name: str
 
     async def submit(
-        self, input_file: Path, endpoint: str | None = None
+        self,
+        input_file: Path,
+        endpoint: str | None = None,
+        intent_id: str | None = None,
     ) -> SubmittedBatch:
         """Validate provider-native input and create a batch."""
         ...

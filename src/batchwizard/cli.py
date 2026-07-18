@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -10,7 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import BatchWizardSettings, config
-from .models import TERMINAL_STATES, CollectionState
+from .models import TERMINAL_STATES, CollectionState, JobState
 from .processor import BatchOrchestrator, JobEvent
 from .providers import available_providers, get_provider
 from .store import AmbiguousJobError, JobStore
@@ -22,6 +23,9 @@ app = typer.Typer(
 )
 console = Console()
 logger = setup_logger(console)
+
+DEFAULT_MAX_CONCURRENT_JOBS = config.settings.max_concurrent_jobs
+DEFAULT_CHECK_INTERVAL = config.settings.check_interval
 
 
 def _validate_provider(provider: str) -> str:
@@ -53,6 +57,38 @@ def _validate_submission_options(provider: str, endpoint: str | None) -> None:
         )
 
 
+def _provider_for_job_id(job_id: str, explicit: str | None, tracked) -> str:
+    if explicit is not None:
+        return _validate_provider(explicit)
+    if tracked is not None:
+        return tracked.provider
+    if job_id.startswith("msgbatch_"):
+        return "anthropic"
+    if job_id.startswith("batch_"):
+        return "openai"
+    raise typer.BadParameter(
+        "Cannot infer the provider for an untracked job; specify --provider",
+        param_hint="provider",
+    )
+
+
+def _format_age(timestamp: str, now: datetime | None = None) -> str:
+    try:
+        updated = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return timestamp
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    seconds = max(0, int(((now or datetime.now(UTC)) - updated).total_seconds()))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86_400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86_400}d ago"
+
+
 def _default_output_dir(output_directory: Path | None) -> Path:
     out = output_directory or Path.cwd() / "results"
     out.mkdir(parents=True, exist_ok=True)
@@ -72,7 +108,7 @@ def _print_submitted(jobs) -> None:
     table.add_column("Batch ID", style="cyan")
     table.add_column("Input", style="green")
     for job in jobs:
-        table.add_row(job.provider, job.batch_id, job.input_path)
+        table.add_row(job.provider, job.reference, job.input_path)
     console.print(table)
     console.print(
         "Run [bold]batchwizard watch[/bold] any time to poll and download results."
@@ -102,10 +138,14 @@ def process(
         None, help="Directory to store output files"
     ),
     max_concurrent_jobs: int = typer.Option(
-        5, help="Maximum number of concurrent jobs"
+        DEFAULT_MAX_CONCURRENT_JOBS,
+        min=1,
+        help="Maximum number of concurrent jobs",
     ),
     check_interval: int = typer.Option(
-        5, help="Initial interval (in seconds) between job status checks"
+        DEFAULT_CHECK_INTERVAL,
+        min=0,
+        help="Initial interval (in seconds) between job status checks",
     ),
     provider: str = typer.Option(
         "openai", "--provider", help="Batch provider: openai or anthropic"
@@ -130,7 +170,9 @@ def process(
     if submit_only:
 
         async def submit():
-            orchestrator = BatchOrchestrator(batch_provider, store)
+            orchestrator = BatchOrchestrator(
+                batch_provider, store, max_concurrent_jobs=max_concurrent_jobs
+            )
             try:
                 return await orchestrator.submit_paths(input_paths, endpoint)
             finally:
@@ -168,6 +210,11 @@ def submit(
         "openai", "--provider", help="Batch provider: openai or anthropic"
     ),
     endpoint: str | None = typer.Option(None, help="OpenAI Batch endpoint"),
+    max_concurrent_jobs: int = typer.Option(
+        DEFAULT_MAX_CONCURRENT_JOBS,
+        min=1,
+        help="Maximum number of concurrent submissions",
+    ),
 ):
     """Submit batch jobs and exit immediately (use 'watch' to collect results later)."""
     _validate_submission_options(provider, endpoint)
@@ -176,7 +223,9 @@ def submit(
     store = JobStore(config.db_file)
 
     async def run():
-        orchestrator = BatchOrchestrator(batch_provider, store)
+        orchestrator = BatchOrchestrator(
+            batch_provider, store, max_concurrent_jobs=max_concurrent_jobs
+        )
         try:
             return await orchestrator.submit_paths(input_paths, endpoint)
         finally:
@@ -191,7 +240,14 @@ def watch(
         None, help="Directory to store output files"
     ),
     check_interval: int = typer.Option(
-        5, help="Initial interval (in seconds) between job status checks"
+        DEFAULT_CHECK_INTERVAL,
+        min=0,
+        help="Initial interval (in seconds) between job status checks",
+    ),
+    max_concurrent_jobs: int = typer.Option(
+        DEFAULT_MAX_CONCURRENT_JOBS,
+        min=1,
+        help="Maximum number of concurrently watched jobs per provider",
     ),
 ):
     """Advance remote jobs and retry any uncollected terminal artifacts."""
@@ -203,7 +259,7 @@ def watch(
         return
     dashboard = Dashboard(Console(), title="BatchWizard Watch")
     for job in actionable:  # seed the table before polling starts
-        dashboard.jobs[(job.provider, job.batch_id)] = job
+        dashboard.jobs[(job.provider, job.reference)] = job
 
     async def run():
         groups: dict[str, list] = defaultdict(list)
@@ -236,6 +292,7 @@ def watch(
                 store,
                 on_event=dashboard.on_event,
                 check_interval=check_interval,
+                max_concurrent_jobs=max_concurrent_jobs,
             )
             try:
                 await orchestrator.watch(jobs, output_dir)
@@ -275,12 +332,12 @@ def status(
     for job in jobs:
         table.add_row(
             job.provider,
-            job.batch_id,
+            job.reference,
             job.provider_status or job.state,
             job.collection_state,
             _request_summary(job),
             Path(job.input_path).name,
-            job.updated_at,
+            _format_age(job.updated_at),
             job.last_local_error or job.error_summary or "",
         )
     console.print(table)
@@ -320,8 +377,112 @@ def configure(
 
 
 @app.command()
+def reconcile(
+    intent_id: str | None = typer.Argument(
+        None, help="Submission intent to reconcile (omit to list unresolved intents)"
+    ),
+    batch_id: str | None = typer.Option(
+        None,
+        "--batch-id",
+        help="Provider batch ID when automatic metadata matching is unavailable",
+    ),
+    discard: bool = typer.Option(
+        False,
+        "--discard",
+        help="Delete an intent after confirming that no provider batch exists",
+    ),
+):
+    """Attach an uncertain submission intent to its provider batch."""
+    store = JobStore(config.db_file)
+    if intent_id is None:
+        unresolved = store.unresolved()
+        if not unresolved:
+            console.print("[green]No unresolved submission intents.[/green]")
+            return
+        table = Table(title="Unresolved Submission Intents")
+        table.add_column("Intent", style="cyan")
+        table.add_column("Provider", style="blue")
+        table.add_column("Input", style="green")
+        table.add_column("Created", style="dim")
+        table.add_column("Detail", style="red")
+        for job in unresolved:
+            table.add_row(
+                job.intent_id,
+                job.provider,
+                job.input_path,
+                _format_age(job.created_at),
+                job.last_local_error or "",
+            )
+        console.print(table)
+        console.print(
+            "Run [bold]batchwizard reconcile INTENT[/bold] for OpenAI metadata "
+            "matching, or add [bold]--batch-id ID[/bold] after identifying the job."
+        )
+        return
+
+    job = store.get_intent(intent_id)
+    if job is None:
+        console.print(f"[red]Unknown submission intent {intent_id!r}.[/red]")
+        raise typer.Exit(code=2)
+    if job.batch_id is not None:
+        console.print(
+            f"[yellow]Intent {intent_id} is already attached to {job.batch_id}.[/yellow]"
+        )
+        return
+    if discard:
+        if batch_id is not None:
+            raise typer.BadParameter(
+                "--discard cannot be combined with --batch-id", param_hint="discard"
+            )
+        store.delete(job)
+        console.print(f"[yellow]Discarded unresolved intent {intent_id}.[/yellow]")
+        return
+
+    _require_api_key(job.provider)
+    batch_provider = get_provider(job.provider)
+
+    async def resolve():
+        candidate = batch_id
+        endpoint = job.endpoint
+        try:
+            if candidate is None:
+                recent = await batch_provider.list_jobs(limit=100)
+                match = next(
+                    (item for item in recent if item.intent_id == intent_id), None
+                )
+                if match is None:
+                    raise ValueError(
+                        "No provider batch with this intent metadata was found; "
+                        "identify it with list-jobs and pass --batch-id"
+                    )
+                candidate = match.batch_id
+                endpoint = match.endpoint or endpoint
+
+            status = await batch_provider.status(candidate)
+            job.batch_id = candidate
+            job.endpoint = endpoint
+            job.state = JobState.PENDING
+            orchestrator = BatchOrchestrator(batch_provider, store)
+            orchestrator._apply_status(job, status)
+            store.update(job)
+            return job
+        finally:
+            await batch_provider.close()
+
+    try:
+        resolved = asyncio.run(resolve())
+    except Exception as error:
+        console.print(f"[red]Could not reconcile {intent_id}: {error}[/red]")
+        raise typer.Exit(code=1) from error
+    console.print(
+        f"[green]Attached intent {intent_id} to {resolved.provider} "
+        f"batch {resolved.batch_id}.[/green]"
+    )
+
+
+@app.command()
 def list_jobs(
-    limit: int = typer.Option(20, help="Number of jobs to display"),
+    limit: int = typer.Option(20, min=1, help="Number of jobs to display"),
     provider: str = typer.Option("openai", "--provider", help="Batch provider"),
 ):
     """List recent batch jobs from the provider (not the local manifest)."""
@@ -335,6 +496,7 @@ def list_jobs(
             table.add_column("Job ID", style="cyan")
             table.add_column("Status", style="magenta")
             table.add_column("Created At", style="green")
+            table.add_column("Intent", style="dim")
             table.add_column("Requests")
             for job in jobs:
                 created_at = (
@@ -346,6 +508,7 @@ def list_jobs(
                     job.batch_id,
                     job.provider_status,
                     created_at,
+                    job.intent_id or "",
                     _request_summary(job),
                 )
             console.print(table)
@@ -364,12 +527,14 @@ def cancel(
 ):
     """Cancel a specific batch job."""
     store = JobStore(config.db_file)
+    if provider is not None:
+        _validate_provider(provider)
     try:
         tracked = store.get(job_id, provider=provider)
     except AmbiguousJobError as error:
         console.print(f"[red]{error}[/red]")
         raise typer.Exit(code=2) from error
-    provider_name = provider or (tracked.provider if tracked else "openai")
+    provider_name = _provider_for_job_id(job_id, provider, tracked)
     _require_api_key(provider_name)
     batch_provider = get_provider(provider_name)
 
@@ -404,12 +569,14 @@ def download(
     """Download results (and error file, if any) for a batch job."""
     output_dir = _default_output_dir(output_directory)
     store = JobStore(config.db_file)
+    if provider is not None:
+        _validate_provider(provider)
     try:
         tracked = store.get(job_id, provider=provider)
     except AmbiguousJobError as error:
         console.print(f"[red]{error}[/red]")
         raise typer.Exit(code=2) from error
-    provider_name = provider or (tracked.provider if tracked else "openai")
+    provider_name = _provider_for_job_id(job_id, provider, tracked)
     _require_api_key(provider_name)
     batch_provider = get_provider(provider_name)
 

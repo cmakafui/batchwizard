@@ -72,6 +72,16 @@ class StubDecoder:
         self.closed = True
 
 
+class StubPage:
+    def __init__(self, items, first_page_size: int | None = None):
+        self.items = items
+        self.data = items[:first_page_size]
+
+    async def __aiter__(self):
+        for item in self.items:
+            yield item
+
+
 class StubBatches:
     def __init__(self, batch=None, decoder=None):
         self.batch = batch or make_batch()
@@ -79,6 +89,7 @@ class StubBatches:
         self.created_requests = []
         self.create_calls = 0
         self.results_error: Exception | None = None
+        self.list_items = [self.batch]
 
     async def create(self, *, requests):
         self.create_calls += 1
@@ -97,7 +108,7 @@ class StubBatches:
         return self.decoder
 
     async def list(self, limit):
-        return SimpleNamespace(data=[self.batch])
+        return StubPage(self.list_items, first_page_size=1)
 
 
 class StubClient:
@@ -124,6 +135,30 @@ def write_valid(path: Path, custom_id: str = "row-1") -> None:
         )
         + "\n"
     )
+
+
+def test_default_client_uses_aiohttp_without_hidden_sdk_retries(monkeypatch):
+    transport = object()
+    captured = {}
+    client = StubClient()
+    monkeypatch.setattr(anthropic_provider, "DefaultAioHttpClient", lambda: transport)
+
+    def make_client(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(anthropic_provider, "AsyncAnthropic", make_client)
+    monkeypatch.setattr(
+        anthropic_provider,
+        "config",
+        SimpleNamespace(get_api_key=lambda name: "key"),
+    )
+
+    provider = AnthropicBatchProvider()
+
+    assert provider.client is client
+    assert captured["http_client"] is transport
+    assert captured["max_retries"] == 0
 
 
 async def test_submit_parses_provider_native_jsonl(tmp_path: Path):
@@ -160,6 +195,11 @@ async def test_submit_parses_provider_native_jsonl(tmp_path: Path):
             '{"custom_id":"x","params":{"model":"m","max_tokens":1,'
             '"messages":[{}],"stream":true}}\n',
             "stream=true",
+        ),
+        (
+            '{"custom_id":"not allowed","params":{"model":"m",'
+            '"max_tokens":1,"messages":[{}]}}\n',
+            "letters, numbers, hyphens",
         ),
     ],
 )
@@ -223,6 +263,22 @@ async def test_anthropic_rejects_openai_endpoint_before_http(tmp_path: Path):
     with pytest.raises(ValueError, match="OpenAI-specific"):
         await provider.submit(input_file, "/v1/responses")
     assert client.batches.create_calls == 0
+
+
+async def test_evolving_message_parameters_are_left_to_anthropic(tmp_path: Path):
+    client = StubClient()
+    provider = AnthropicBatchProvider(client=client)
+    input_file = tmp_path / "future.jsonl"
+    write_valid(input_file)
+    request = json.loads(input_file.read_text())
+    request["params"]["future_batch_parameter"] = {"mode": "new"}
+    input_file.write_text(json.dumps(request) + "\n")
+
+    await provider.submit(input_file)
+
+    assert client.batches.created_requests[0]["params"]["future_batch_parameter"] == {
+        "mode": "new"
+    }
 
 
 async def test_status_maps_lifecycle_and_all_request_outcomes():
@@ -355,3 +411,17 @@ async def test_cancel_and_list_use_provider_neutral_models():
     assert jobs[0].created_at == batch.created_at
     assert jobs[0].completed_count == 3
     assert jobs[0].cancelled_count == 1
+
+
+async def test_list_jobs_iterates_beyond_first_sdk_page():
+    batches = StubBatches()
+    batches.list_items = [make_batch(id=f"msgbatch_{index}") for index in range(3)]
+    provider = AnthropicBatchProvider(client=StubClient(batches))
+
+    jobs = await provider.list_jobs(limit=3)
+
+    assert [job.batch_id for job in jobs] == [
+        "msgbatch_0",
+        "msgbatch_1",
+        "msgbatch_2",
+    ]

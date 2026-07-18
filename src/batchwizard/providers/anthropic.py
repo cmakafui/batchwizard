@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import cast
 
-from anthropic import AnthropicError, AsyncAnthropic, NotFoundError
+from anthropic import (
+    AnthropicError,
+    AsyncAnthropic,
+    DefaultAioHttpClient,
+    NotFoundError,
+)
 from anthropic.types.messages.batch_create_params import Request
 from loguru import logger
 
@@ -25,16 +31,7 @@ MAX_BATCH_REQUESTS = 100_000
 MAX_BATCH_BYTES = 256 * 1024 * 1024
 ANTHROPIC_BATCH_ENDPOINT = "/v1/messages/batches"
 
-_UNSUPPORTED_PARAMS = frozenset(
-    {
-        "speed",
-        "store",
-        "previous_thread_event_id",
-        "cache_hint",
-        "context_hint",
-        "research_preview_2026_02",
-    }
-)
+_CUSTOM_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _STATE_MAP = {
     "in_progress": JobState.RUNNING,
@@ -48,10 +45,17 @@ class AnthropicBatchProvider:
     name = "anthropic"
 
     def __init__(self, client: AsyncAnthropic | None = None):
-        self.client = client or AsyncAnthropic(api_key=config.get_api_key("anthropic"))
+        self.client = client or AsyncAnthropic(
+            api_key=config.get_api_key("anthropic"),
+            http_client=DefaultAioHttpClient(),
+            max_retries=0,
+        )
 
     async def submit(
-        self, input_file: Path, endpoint: str | None = None
+        self,
+        input_file: Path,
+        endpoint: str | None = None,
+        intent_id: str | None = None,
     ) -> SubmittedBatch:
         if endpoint is not None:
             raise ValueError(
@@ -142,14 +146,17 @@ class AnthropicBatchProvider:
         return _normalize_status(batch)
 
     async def list_jobs(self, limit: int = 20) -> list[ProviderJobSummary]:
-        page = await self.client.messages.batches.list(limit=limit)
+        if limit < 1:
+            return []
+        page = await self.client.messages.batches.list(limit=min(limit, 100))
         jobs = []
-        for batch in page.data[:limit]:
+        async for batch in page:
             counts = batch.request_counts
             jobs.append(
                 ProviderJobSummary(
                     batch_id=batch.id,
                     provider_status=batch.processing_status,
+                    endpoint=ANTHROPIC_BATCH_ENDPOINT,
                     created_at=batch.created_at,
                     completed_count=counts.succeeded,
                     failed_count=counts.errored,
@@ -158,6 +165,8 @@ class AnthropicBatchProvider:
                     total_count=_request_total(counts),
                 )
             )
+            if len(jobs) >= limit:
+                break
         return jobs
 
     async def close(self) -> None:
@@ -172,6 +181,7 @@ def _load_requests(input_file: Path) -> list[dict]:
 
     requests: list[dict] = []
     custom_ids: set[str] = set()
+    serialized_size = len(b'{"requests":[') + len(b"]}")
     try:
         lines = input_file.open(encoding="utf-8")
     except UnicodeError as error:
@@ -184,22 +194,27 @@ def _load_requests(input_file: Path) -> list[dict]:
                     raise ValueError(
                         f"{input_file}: exceeds Anthropic's 100,000-request limit"
                     )
-                requests.append(
-                    _parse_request_line(line, line_number, custom_ids, input_file)
+                request = _parse_request_line(line, line_number, custom_ids, input_file)
+                if requests:
+                    serialized_size += 1
+                serialized_size += len(
+                    json.dumps(
+                        request,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
                 )
+                if serialized_size > MAX_BATCH_BYTES:
+                    raise ValueError(
+                        f"{input_file}: serialized Anthropic request exceeds 256 MB"
+                    )
+                requests.append(request)
     except UnicodeError as error:
         raise ValueError(f"{input_file}: input must be UTF-8 JSONL") from error
 
     if not requests:
         raise ValueError(f"{input_file}: batch input must contain at least one request")
 
-    serialized_size = len(
-        json.dumps(
-            {"requests": requests}, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-    )
-    if serialized_size > MAX_BATCH_BYTES:
-        raise ValueError(f"{input_file}: serialized Anthropic request exceeds 256 MB")
     return requests
 
 
@@ -217,8 +232,11 @@ def _parse_request_line(
         raise ValueError(f"{prefix}: each request must be a JSON object")
 
     custom_id = request.get("custom_id")
-    if not isinstance(custom_id, str) or not 1 <= len(custom_id) <= 64:
-        raise ValueError(f"{prefix}: custom_id must be a 1-64 character string")
+    if not isinstance(custom_id, str) or not _CUSTOM_ID_PATTERN.fullmatch(custom_id):
+        raise ValueError(
+            f"{prefix}: custom_id must contain 1-64 letters, numbers, hyphens, "
+            "or underscores"
+        )
     if custom_id in custom_ids:
         raise ValueError(f"{prefix}: duplicate custom_id {custom_id!r}")
     custom_ids.add(custom_id)
@@ -239,12 +257,6 @@ def _parse_request_line(
         raise ValueError(f"{prefix}: params.max_tokens must be an integer >= 1")
     if params.get("stream") is True:
         raise ValueError(f"{prefix}: params.stream=true is not supported in batches")
-    unsupported = sorted(_UNSUPPORTED_PARAMS.intersection(params))
-    if unsupported:
-        raise ValueError(
-            f"{prefix}: unsupported Anthropic batch parameter(s): "
-            f"{', '.join(unsupported)}"
-        )
     return request
 
 

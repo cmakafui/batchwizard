@@ -14,6 +14,7 @@ from .models import ACTIVE_STATES, CollectionState, JobRecord, JobState
 from .processor import JobEvent
 
 _STATE_COLORS = {
+    JobState.SUBMITTING: "yellow",
     JobState.COMPLETED: "green",
     JobState.FAILED: "red",
     JobState.EXPIRED: "red",
@@ -49,14 +50,14 @@ class Dashboard:
         if event.kind == "log":
             self.logs.append(event.message)
         elif event.job is not None:
-            key = (event.job.provider, event.job.batch_id)
+            key = (event.job.provider, event.job.reference)
             self.jobs[key] = event.job
             if event.kind == "submitted":
-                self.logs.append(f"Submitted {event.job.batch_id}")
+                self.logs.append(f"Submitted {event.job.reference}")
             elif event.kind == "status" and event.message:
                 self.progress[key] = event.message
             elif event.kind == "attention":
-                self.logs.append(f"Job {event.job.batch_id} needs attention")
+                self.logs.append(f"Job {event.job.reference} needs attention")
                 if event.message:
                     self.logs.append(f"  ↳ {event.message}")
             elif event.kind == "finished":
@@ -85,7 +86,7 @@ class Dashboard:
             label = job.provider_status or job.state
             table.add_row(
                 job.provider,
-                job.batch_id,
+                job.reference,
                 f"[{color}]{label}[/{color}]",
                 self.progress.get(key, ""),
                 (f"[{collection_color}]{job.collection_state}[/{collection_color}]"),
@@ -181,8 +182,8 @@ class Dashboard:
         self.console.print(f"Still actionable: {actionable}")
         for job in self.jobs.values():
             if job.error_summary:
-                self.console.print(f"[red]{job.batch_id}[/red]: {job.error_summary}")
+                self.console.print(f"[red]{job.reference}[/red]: {job.error_summary}")
             if job.last_local_error:
                 self.console.print(
-                    f"[yellow]{job.batch_id}[/yellow]: {job.last_local_error}"
+                    f"[yellow]{job.reference}[/yellow]: {job.last_local_error}"
                 )

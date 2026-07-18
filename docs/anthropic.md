@@ -20,14 +20,23 @@ batchwizard submit --provider anthropic input.jsonl
 BatchWizard validates the batch envelope before making an HTTP request:
 
 - 1–100,000 requests and a serialized request size no greater than 256 MB
-- unique 1–64 character `custom_id` values
+- unique 1–64 character `custom_id` values containing only letters, numbers,
+  hyphens, and underscores
 - object-valued `params` with `model`, `messages`, and `max_tokens >= 1`
-- parameters that the current Message Batches API explicitly does not support
+- `stream` must not be `true`
 
 The complete Messages parameter surface evolves independently. Anthropic
 validates those parameters asynchronously and returns invalid rows as
 `result.type == "errored"`; BatchWizard does not claim to reproduce that server
 validator.
+
+### Prompt caching
+
+Message Batches and prompt caching can be combined, and their pricing discounts
+stack. Put the shared prefix first and use identical `cache_control` breakpoints
+across rows. Because rows run asynchronously and concurrently, cache hits are
+best-effort; Anthropic recommends the 1-hour TTL for batches with shared context
+that may process beyond the default 5-minute cache lifetime.
 
 ## Lifecycle and outcomes
 
@@ -64,5 +73,6 @@ reports them archived, collection becomes `unavailable` rather than retrying a
 permanent loss forever.
 
 See the current [Message Batches guide](https://platform.claude.com/docs/en/build-with-claude/batch-processing),
+[prompt caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
 [Python SDK documentation](https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python),
 and [Batch API reference](https://platform.claude.com/docs/en/api/python/messages/batches).

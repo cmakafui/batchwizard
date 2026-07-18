@@ -21,7 +21,8 @@ def test_add_and_get_roundtrip(store: JobStore):
     assert loaded.batch_id == "batch_1"
     assert loaded.state == JobState.PENDING
     assert loaded.provider == "openai"
-    assert loaded.endpoint == "/v1/chat/completions"
+    assert loaded.endpoint is None
+    assert loaded.intent_id == job.intent_id
 
 
 def test_update_persists_all_fields(store: JobStore):
@@ -80,6 +81,20 @@ def test_same_native_id_is_allowed_for_different_providers(store: JobStore):
     assert store.get("shared_id", provider="anthropic").provider == "anthropic"
     with pytest.raises(AmbiguousJobError, match="Specify --provider"):
         store.get("shared_id")
+
+
+def test_unresolved_submission_intents_allow_null_batch_ids(store: JobStore):
+    first = store.add(JobRecord(input_path="/tmp/a.jsonl", state=JobState.SUBMITTING))
+    second = store.add(JobRecord(input_path="/tmp/b.jsonl", state=JobState.SUBMITTING))
+
+    assert first.batch_id is None
+    assert second.batch_id is None
+    assert first.intent_id != second.intent_id
+    assert [job.intent_id for job in store.unresolved()] == [
+        first.intent_id,
+        second.intent_id,
+    ]
+    assert store.get_intent(first.intent_id).input_path == "/tmp/a.jsonl"
 
 
 def test_store_survives_reopen(tmp_path):
@@ -158,7 +173,7 @@ def test_v04_manifest_migrates_conservatively(tmp_path):
 
     store = JobStore(path)
 
-    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert store.get("active").collection_state == CollectionState.NOT_READY
     assert store.get("with_files").collection_state == CollectionState.COLLECTED
     assert store.get("missing_files").collection_state == CollectionState.PENDING
@@ -166,6 +181,7 @@ def test_v04_manifest_migrates_conservatively(tmp_path):
         "active",
         "missing_files",
     ]
+    assert store.get("active").intent_id == "legacy-1"
     anthropic = make_job("active")
     anthropic.provider = "anthropic"
     store.add(anthropic)

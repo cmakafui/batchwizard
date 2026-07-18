@@ -17,8 +17,8 @@ class BatchWizardSettings(BaseSettings):
         None,
         validation_alias=AliasChoices("anthropic_api_key", "ANTHROPIC_API_KEY"),
     )
-    max_concurrent_jobs: int = 5
-    check_interval: int = 5
+    max_concurrent_jobs: int = Field(default=5, ge=1)
+    check_interval: int = Field(default=5, ge=0)
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

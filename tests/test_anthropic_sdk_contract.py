@@ -101,6 +101,7 @@ async def test_real_sdk_ga_async_batch_contract():
                     "params": {
                         "model": "claude-opus-4-8",
                         "max_tokens": 32,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
                         "messages": [{"role": "user", "content": "hello"}],
                     },
                 }
@@ -119,6 +120,10 @@ async def test_real_sdk_ga_async_batch_contract():
         body for method, path, body in calls if path == "/v1/messages/batches"
     )
     assert json.loads(create_body)["requests"][0]["custom_id"] == "row-1"
+    assert json.loads(create_body)["requests"][0]["params"]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
     assert future.processing_status == "future_provider_state"
     assert canceled.processing_status == "canceling"
     assert page.data[0].id == "msgbatch_new"

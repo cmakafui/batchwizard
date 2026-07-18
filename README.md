@@ -75,9 +75,9 @@ Anthropic uses the native Message Batches format:
 batchwizard submit --provider anthropic anthropic.jsonl
 ```
 
-BatchWizard validates the batch envelope, unique `custom_id` values, batch size,
-and parameters that Anthropic explicitly excludes from batch processing. The
-provider remains responsible for validating the full Messages request.
+BatchWizard validates the batch envelope, `custom_id` syntax and uniqueness,
+batch size, `max_tokens`, and the non-streaming requirement. Anthropic remains
+responsible for validating the evolving Messages parameter surface.
 
 See [Anthropic Message Batches](docs/anthropic.md) for lifecycle, cancellation,
 result routing, and retention details.
@@ -93,6 +93,13 @@ batchwizard watch --output-directory ./results
 
 `watch` groups jobs by provider and polls those groups concurrently. A missing
 credential for one provider does not block the other provider's jobs.
+
+Submission intents are written to the local manifest before network I/O. If a
+connection fails after the provider may have accepted a batch, BatchWizard keeps
+the intent instead of risking a duplicate submission. Inspect and recover those
+rows with `batchwizard reconcile`; OpenAI intents are matched through batch
+metadata, while Anthropic batches can be attached with `--batch-id` after they
+are identified with `list-jobs`.
 
 Remote execution and local artifact collection are tracked separately. A
 completed provider job remains actionable until its files are collected. Failed
@@ -129,6 +136,7 @@ file.
 | `watch` | Resume actionable jobs and collect terminal artifacts. |
 | `process` | Submit, wait, and collect in one invocation. |
 | `status` | Inspect jobs in the local SQLite manifest. |
+| `reconcile` | Recover a submission whose provider outcome was uncertain. |
 | `list-jobs` | List recent jobs directly from one provider. |
 | `cancel` | Request cancellation; provider inference works for tracked jobs. |
 | `download` | Collect one batch's result artifacts. |
