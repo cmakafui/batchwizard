@@ -1,11 +1,11 @@
 # BatchWizard
 
-BatchWizard is a durable CLI for OpenAI and Anthropic batch jobs. Submit
-provider-native JSONL, close the terminal, and come back later: a local SQLite
-manifest tracks what is running, what still needs to be downloaded, and what
-needs your attention.
+BatchWizard is a durable CLI for OpenAI, Anthropic, and Gemini batch jobs.
+Submit provider-native JSONL, close the terminal, and come back later: a local
+SQLite manifest tracks what is running, what still needs to be downloaded, and
+what needs your attention.
 
-It does not translate prompts between APIs. OpenAI and Anthropic have
+It does not translate prompts between APIs. OpenAI, Anthropic, and Gemini have
 different request formats and capabilities; BatchWizard gives them one
 operational lifecycle without pretending they are the same protocol.
 
@@ -17,18 +17,20 @@ Install BatchWizard as an isolated Python 3.11+ tool:
 uv tool install batchwizard
 ```
 
-Provide one or both standard API-key environment variables:
+Provide any of the standard API-key environment variables:
 
 ```bash
 export OPENAI_API_KEY="..."
 export ANTHROPIC_API_KEY="..."
+export GEMINI_API_KEY="..."
 ```
 
-Submit native JSONL to either provider:
+Submit native JSONL to any provider:
 
 ```bash
 batchwizard submit openai.jsonl --endpoint /v1/responses
 batchwizard submit --provider anthropic anthropic.jsonl
+batchwizard submit --provider gemini --model gemini-3.6-flash gemini.jsonl
 ```
 
 The submit process can exit once the providers accept the work. One later
@@ -39,8 +41,8 @@ batchwizard watch --output-directory ./results
 batchwizard status --all
 ```
 
-`watch` is provider-free. The manifest records which adapter owns
-each batch, so a single invocation can resume a mixture of OpenAI and Anthropic
+`watch` is provider-free. The manifest records which adapter owns each batch,
+so a single invocation can resume a mixture of OpenAI, Anthropic, and Gemini
 jobs. Missing credentials or a temporary download failure for one provider do
 not erase work or prevent other provider groups from advancing.
 
@@ -49,15 +51,15 @@ not erase work or prevent other provider groups from advancing.
 BatchWizard accepts each provider's native JSONL rather than maintaining a lossy
 common prompt schema.
 
-| | OpenAI | Anthropic |
-| --- | --- | --- |
-| Select with | default, or `--provider openai` | `--provider anthropic` |
-| JSONL row | `{"custom_id", "method", "url", "body"}` | `{"custom_id", "params"}` |
-| Model location | `body.model` | `params.model` |
-| Submission | file upload, then Batch creation | requests sent inline to Message Batches |
-| Provider status | Batch `status` | Message Batch `processing_status` |
-| Results | provider output and error files | unordered result stream split by outcome |
-| Recovery after an uncertain submit | automatic intent matching through Batch metadata | manual attachment by batch ID |
+| | OpenAI | Anthropic | Gemini |
+| --- | --- | --- | --- |
+| Select with | default, or `--provider openai` | `--provider anthropic` | `--provider gemini` |
+| JSONL row | `{"custom_id", "method", "url", "body"}` | `{"custom_id", "params"}` | `{"key", "request"}` |
+| Model location | `body.model` | `params.model` | batch-level `--model` |
+| Submission | file upload, then Batch creation | requests sent inline to Message Batches | file upload, then batch creation |
+| Provider status | Batch `status` | Message Batch `processing_status` | batch Operation state |
+| Results | provider output and error files | unordered result stream split by outcome | result file or inline responses, split by outcome |
+| Recovery after an uncertain submit | automatic intent matching through Batch metadata | manual attachment by batch ID | automatic intent matching through the display name |
 
 ### OpenAI
 
@@ -90,6 +92,25 @@ Anthropic remains responsible for validating its evolving Messages parameter
 surface. See [Anthropic Message Batches](docs/anthropic.md) for result routing,
 prompt caching, cancellation, and retention behavior.
 
+### Gemini
+
+```jsonl
+{"key":"ticket-1","request":{"contents":[{"parts":[{"text":"Classify this ticket as billing, technical, or other."}],"role":"user"}]}}
+```
+
+Gemini takes the model as a batch-level argument rather than reading it from
+each row, so `--model` is required:
+
+```bash
+batchwizard submit --provider gemini --model gemini-3.6-flash gemini.jsonl
+```
+
+BatchWizard validates `key` uniqueness, the request envelope, and the 2 GB
+input limit before submission; Gemini remains responsible for validating its
+evolving `GenerateContentRequest` surface. See
+[Gemini Batch API](docs/gemini.md) for lifecycle mapping, result routing, and
+retention behavior.
+
 ## Durable jobs and recovery
 
 The manifest separates remote execution from local artifact collection. A
@@ -107,9 +128,10 @@ batchwizard reconcile INTENT
 batchwizard reconcile INTENT --batch-id MSGBATCH_ID
 ```
 
-OpenAI intents can be matched through Batch metadata. Anthropic does not expose
-equivalent batch metadata, so its uncertain submissions are attached after the
-matching batch is identified with `list-jobs`.
+OpenAI intents can be matched through Batch metadata and Gemini intents through
+the batch display name. Anthropic does not expose equivalent batch metadata, so
+its uncertain submissions are attached after the matching batch is identified
+with `list-jobs`.
 
 The lifecycle and SQLite migrations are documented in
 [Job lifecycle](docs/job-lifecycle.md).
@@ -133,8 +155,12 @@ also be persisted for convenience:
 ```bash
 batchwizard configure --provider openai --set-key "$OPENAI_API_KEY"
 batchwizard configure --provider anthropic --set-key "$ANTHROPIC_API_KEY"
+batchwizard configure --provider gemini --set-key "$GEMINI_API_KEY"
 batchwizard configure --show --provider openai
 ```
+
+The Gemini key is read from `GEMINI_API_KEY`, falling back to
+`GOOGLE_API_KEY`.
 
 Persisted keys are plaintext JSON, written atomically with owner-only file
 permissions. Treat that file as a secret. Prefer environment variables (or a

@@ -15,9 +15,37 @@ from .models import (
     utcnow,
 )
 
-_LATEST_SCHEMA_VERSION = 3
+_LATEST_SCHEMA_VERSION = 4
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    intent_id TEXT NOT NULL UNIQUE,
+    batch_id TEXT,
+    input_path TEXT NOT NULL,
+    endpoint TEXT,
+    model TEXT,
+    state TEXT NOT NULL,
+    provider_status TEXT NOT NULL DEFAULT '',
+    collection_state TEXT NOT NULL DEFAULT 'not_ready',
+    completed_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    cancelled_count INTEGER NOT NULL DEFAULT 0,
+    expired_count INTEGER NOT NULL DEFAULT 0,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    output_path TEXT,
+    error_path TEXT,
+    error_summary TEXT,
+    last_local_error TEXT,
+    poll_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider, batch_id)
+);
+"""
+
+_SCHEMA_V3 = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL,
@@ -70,12 +98,38 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+# Manifest columns as of schema v3, pinned so historical migrations keep
+# rebuilding the exact table shape they were written against.
+_FIELDS_V3 = [
+    "provider",
+    "intent_id",
+    "batch_id",
+    "input_path",
+    "endpoint",
+    "state",
+    "provider_status",
+    "collection_state",
+    "completed_count",
+    "failed_count",
+    "cancelled_count",
+    "expired_count",
+    "total_count",
+    "output_path",
+    "error_path",
+    "error_summary",
+    "last_local_error",
+    "poll_failures",
+    "created_at",
+    "updated_at",
+]
+
 _FIELDS = [
     "provider",
     "intent_id",
     "batch_id",
     "input_path",
     "endpoint",
+    "model",
     "state",
     "provider_status",
     "collection_state",
@@ -130,6 +184,9 @@ class JobStore:
             version = 2
         if version == 2:
             self._migrate_v2_to_v3()
+            version = 3
+        if version == 3:
+            self._migrate_v3_to_v4()
 
     def _migrate_v0_to_v1(self) -> None:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(jobs)")}
@@ -175,7 +232,7 @@ class JobStore:
     def _migrate_v1_to_v2(self) -> None:
         """Make provider + batch ID the durable identity."""
         fields = ", ".join(
-            ["id", *(field for field in _FIELDS if field != "intent_id")]
+            ["id", *(field for field in _FIELDS_V3 if field != "intent_id")]
         )
         with self.conn:
             self.conn.execute("ALTER TABLE jobs RENAME TO jobs_v1")
@@ -188,8 +245,8 @@ class JobStore:
 
     def _migrate_v2_to_v3(self) -> None:
         """Persist submission intents before a provider assigns a batch ID."""
-        old_fields = [field for field in _FIELDS if field != "intent_id"]
-        destination = ", ".join(["id", *_FIELDS])
+        old_fields = [field for field in _FIELDS_V3 if field != "intent_id"]
+        destination = ", ".join(["id", *_FIELDS_V3])
         source = ", ".join(
             [
                 "id",
@@ -200,12 +257,18 @@ class JobStore:
         )
         with self.conn:
             self.conn.execute("ALTER TABLE jobs RENAME TO jobs_v2")
-            self.conn.execute(_SCHEMA)
+            self.conn.execute(_SCHEMA_V3)
             self.conn.execute(
                 f"INSERT INTO jobs ({destination}) SELECT {source} FROM jobs_v2"
             )
             self.conn.execute("DROP TABLE jobs_v2")
             self.conn.execute("PRAGMA user_version = 3")
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Record the batch-level model for providers that take one at submit."""
+        with self.conn:
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN model TEXT")
+            self.conn.execute("PRAGMA user_version = 4")
 
     def add(self, job: JobRecord) -> JobRecord:
         cur = self.conn.execute(

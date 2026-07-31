@@ -77,6 +77,9 @@ class JobRecord(BaseModel):
     batch_id: str | None = None
     input_path: str
     endpoint: str | None = None
+    # Batch-level model for providers (Gemini) whose batch API takes the model
+    # as a submission argument instead of reading it from each JSONL row.
+    model: str | None = None
     state: JobState = JobState.PENDING
     provider_status: str = ""
     collection_state: CollectionState = CollectionState.NOT_READY

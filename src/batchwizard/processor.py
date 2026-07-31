@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from anthropic import APIConnectionError as AnthropicConnectionError
 from loguru import logger
 from openai import APIConnectionError as OpenAIConnectionError
@@ -61,7 +62,10 @@ class BatchOrchestrator:
             self.on_event(JobEvent(kind=kind, job=job, message=message))
 
     async def submit_paths(
-        self, input_paths: list[Path], endpoint: str | None = None
+        self,
+        input_paths: list[Path],
+        endpoint: str | None = None,
+        model: str | None = None,
     ) -> list[JobRecord]:
         """Upload inputs, create batches, and record them in the manifest."""
         files = discover_jsonl(input_paths)
@@ -78,6 +82,7 @@ class BatchOrchestrator:
                         provider=self.provider.name,
                         input_path=str(input_file),
                         endpoint=endpoint,
+                        model=model,
                         state=JobState.SUBMITTING,
                         provider_status="submitting",
                     )
@@ -90,7 +95,7 @@ class BatchOrchestrator:
             async with semaphore:
                 try:
                     submitted = await self.provider.submit(
-                        input_file, endpoint, intent_id=job.intent_id
+                        input_file, endpoint, intent_id=job.intent_id, model=model
                     )
                 except ValueError as e:
                     self.store.delete(job)
@@ -259,17 +264,24 @@ class BatchOrchestrator:
         input_paths: list[Path],
         output_dir: Path,
         endpoint: str | None = None,
+        model: str | None = None,
     ) -> list[JobRecord]:
         """Submit and then watch to completion (the classic blocking flow)."""
-        jobs = await self.submit_paths(input_paths, endpoint)
+        jobs = await self.submit_paths(input_paths, endpoint, model)
         return await self.watch(jobs, output_dir)
 
 
 def _is_retryable(error: Exception) -> bool:
     """Retry only SDK transport failures and documented transient HTTP statuses."""
-    if isinstance(error, (AnthropicConnectionError, OpenAIConnectionError)):
+    # google-genai raises raw httpx transport errors instead of wrapping them.
+    if isinstance(
+        error, (AnthropicConnectionError, OpenAIConnectionError, httpx.TransportError)
+    ):
         return True
+    # OpenAI and Anthropic use .status_code; google-genai APIError uses .code.
     status_code = getattr(error, "status_code", None)
     if status_code is None:
+        status_code = getattr(error, "code", None)
+    if not isinstance(status_code, int):
         return False
     return status_code in {408, 409, 429} or status_code >= 500

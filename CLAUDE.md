@@ -1,21 +1,22 @@
 # CLAUDE.md
 
-BatchWizard is a CLI that gives OpenAI and Anthropic batch jobs one durable
-operational lifecycle. It does not translate prompts between providers; input
-and result JSONL stay provider-native.
+BatchWizard is a CLI that gives OpenAI, Anthropic, and Gemini batch jobs one
+durable operational lifecycle. It does not translate prompts between
+providers; input and result JSONL stay provider-native.
 
 ## Layout
 
 - `src/batchwizard/cli.py` - Typer entrypoint and commands.
 - `src/batchwizard/processor.py` - submit/watch/collect orchestration.
 - `src/batchwizard/providers/` - `base.py` defines the provider contract;
-  `openai.py` and `anthropic.py` implement it.
+  `openai.py`, `anthropic.py`, and `gemini.py` implement it.
 - `src/batchwizard/store.py` - SQLite manifest (schema, migrations, queries).
 - `src/batchwizard/models.py` - Pydantic models, including `JobRecord`.
 - `src/batchwizard/config.py` - credential storage and settings.
 - `src/batchwizard/ui.py` - Rich output formatting.
 - `docs/job-lifecycle.md` - state machine and manifest schema.
 - `docs/anthropic.md` - Anthropic Message Batches specifics.
+- `docs/gemini.md` - Gemini Batch API specifics.
 
 ## Commands
 

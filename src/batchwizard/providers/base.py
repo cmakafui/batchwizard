@@ -27,8 +27,15 @@ class BatchProvider(Protocol):
         input_file: Path,
         endpoint: str | None = None,
         intent_id: str | None = None,
+        model: str | None = None,
     ) -> SubmittedBatch:
-        """Validate provider-native input and create a batch."""
+        """Validate provider-native input and create a batch.
+
+        ``endpoint`` and ``model`` are submission targets that only some
+        providers accept: OpenAI selects a Batch endpoint, Gemini takes a
+        batch-level model, and adapters reject the selector they do not use
+        rather than silently ignoring it.
+        """
         ...
 
     async def status(self, batch_id: str) -> BatchStatus:

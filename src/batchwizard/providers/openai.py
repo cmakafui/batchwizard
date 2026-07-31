@@ -77,7 +77,13 @@ class OpenAIBatchProvider:
         input_file: Path,
         endpoint: str | None = None,
         intent_id: str | None = None,
+        model: str | None = None,
     ) -> SubmittedBatch:
+        if model is not None:
+            raise ValueError(
+                "--model is Gemini-specific; OpenAI batches read the model "
+                "from each row's body.model"
+            )
         endpoint = endpoint or DEFAULT_ENDPOINT
         if endpoint not in SUPPORTED_ENDPOINTS:
             available = ", ".join(sorted(SUPPORTED_ENDPOINTS))
