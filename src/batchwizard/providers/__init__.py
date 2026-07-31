@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from .anthropic import AnthropicBatchProvider
 from .base import BatchProvider
+from .gemini import GeminiBatchProvider
 from .openai import OpenAIBatchProvider
 
 _PROVIDERS = {
     "openai": OpenAIBatchProvider,
     "anthropic": AnthropicBatchProvider,
+    "gemini": GeminiBatchProvider,
 }
 
 
@@ -27,6 +29,7 @@ def available_providers() -> tuple[str, ...]:
 __all__ = [
     "AnthropicBatchProvider",
     "BatchProvider",
+    "GeminiBatchProvider",
     "OpenAIBatchProvider",
     "available_providers",
     "get_provider",

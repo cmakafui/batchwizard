@@ -22,8 +22,7 @@ def test_root_help_describes_the_shipped_providers():
     result = runner.invoke(cli.app, ["--help"])
 
     assert result.exit_code == 0
-    assert "Manage LLM batch jobs across OpenAI and Anthropic" in result.stdout
-    assert "Gemini" not in result.stdout
+    assert "Manage LLM batch jobs across OpenAI, Anthropic, and Gemini" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -314,6 +313,77 @@ def test_anthropic_rejects_explicit_openai_endpoint_before_key_check(tmp_path):
 
     assert result.exit_code != 0
     assert "OpenAI-specific" in result.output
+
+
+def test_gemini_requires_batch_level_model_before_key_check(tmp_path):
+    input_file = tmp_path / "input.jsonl"
+    input_file.write_text("{}\n")
+
+    result = runner.invoke(cli.app, ["submit", "--provider", "gemini", str(input_file)])
+
+    assert result.exit_code != 0
+    assert "--model" in result.output
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_model_is_rejected_for_row_level_model_providers(tmp_path, provider):
+    input_file = tmp_path / "input.jsonl"
+    input_file.write_text("{}\n")
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "submit",
+            "--provider",
+            provider,
+            "--model",
+            "gemini-3.6-flash",
+            str(input_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Gemini-specific" in result.output
+
+
+def test_gemini_rejects_openai_endpoint_before_key_check(tmp_path):
+    input_file = tmp_path / "input.jsonl"
+    input_file.write_text("{}\n")
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "submit",
+            "--provider",
+            "gemini",
+            "--model",
+            "gemini-3.6-flash",
+            "--endpoint",
+            "/v1/responses",
+            str(input_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "OpenAI-specific" in result.output
+
+
+def test_untracked_gemini_id_infers_provider_for_cancel(tmp_path, monkeypatch):
+    database = tmp_path / "jobs.db"
+    selected = []
+    provider = CliProvider("gemini")
+    monkeypatch.setattr(cli, "config", SimpleNamespace(db_file=database))
+    monkeypatch.setattr(cli, "get_api_key", lambda name: "key")
+    monkeypatch.setattr(
+        cli,
+        "get_provider",
+        lambda name: selected.append(name) or provider,
+    )
+
+    result = runner.invoke(cli.app, ["cancel", "batches/untracked"])
+
+    assert result.exit_code == 0
+    assert selected == ["gemini"]
 
 
 def test_untracked_anthropic_id_infers_provider_for_cancel(tmp_path, monkeypatch):

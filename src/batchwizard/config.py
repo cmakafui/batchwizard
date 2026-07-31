@@ -17,6 +17,12 @@ class BatchWizardSettings(BaseSettings):
         None,
         validation_alias=AliasChoices("anthropic_api_key", "ANTHROPIC_API_KEY"),
     )
+    gemini_api_key: str | None = Field(
+        None,
+        validation_alias=AliasChoices(
+            "gemini_api_key", "GEMINI_API_KEY", "GOOGLE_API_KEY"
+        ),
+    )
     max_concurrent_jobs: int = Field(default=5, ge=1)
     check_interval: int = Field(default=5, ge=0)
     model_config = SettingsConfigDict(
@@ -64,19 +70,28 @@ class Config(BaseModel):
 
     def get_api_key(self, provider: str = "openai") -> str | None:
         fields = {
-            "openai": ("openai_api_key", "OPENAI_API_KEY"),
-            "anthropic": ("anthropic_api_key", "ANTHROPIC_API_KEY"),
+            "openai": ("openai_api_key", ("OPENAI_API_KEY",)),
+            "anthropic": ("anthropic_api_key", ("ANTHROPIC_API_KEY",)),
+            "gemini": ("gemini_api_key", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
         }
         try:
-            field, environment = fields[provider]
+            field, environments = fields[provider]
         except KeyError:
             raise ValueError(f"Unknown provider {provider!r}") from None
-        return getattr(self.settings, field) or os.getenv(environment)
+        stored = getattr(self.settings, field)
+        if stored:
+            return stored
+        for environment in environments:
+            value = os.getenv(environment)
+            if value:
+                return value
+        return None
 
     def set_api_key(self, api_key: str, provider: str = "openai") -> None:
         fields = {
             "openai": "openai_api_key",
             "anthropic": "anthropic_api_key",
+            "gemini": "gemini_api_key",
         }
         try:
             field = fields[provider]

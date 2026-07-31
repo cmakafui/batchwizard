@@ -19,7 +19,7 @@ from .store import AmbiguousJobError, JobStore
 from .ui import Dashboard
 from .utils import get_api_key, set_api_key, setup_logger
 
-app = typer.Typer(help="Manage LLM batch jobs across OpenAI and Anthropic")
+app = typer.Typer(help="Manage LLM batch jobs across OpenAI, Anthropic, and Gemini")
 console = Console()
 logger = setup_logger(console)
 
@@ -47,12 +47,26 @@ def _require_api_key(provider: str) -> None:
         raise typer.Exit(code=1)
 
 
-def _validate_submission_options(provider: str, endpoint: str | None) -> None:
+def _validate_submission_options(
+    provider: str, endpoint: str | None, model: str | None
+) -> None:
     _validate_provider(provider)
     if provider != "openai" and endpoint is not None:
         raise typer.BadParameter(
-            "--endpoint is OpenAI-specific and cannot be used with Anthropic",
+            f"--endpoint is OpenAI-specific and cannot be used with {provider.title()}",
             param_hint="endpoint",
+        )
+    if provider != "gemini" and model is not None:
+        raise typer.BadParameter(
+            "--model is Gemini-specific; OpenAI and Anthropic read the model "
+            "from each JSONL row",
+            param_hint="model",
+        )
+    if provider == "gemini" and model is None:
+        raise typer.BadParameter(
+            "Gemini batches take the model as a batch-level argument; "
+            "pass --model (e.g. --model gemini-3.6-flash)",
+            param_hint="model",
         )
 
 
@@ -63,6 +77,8 @@ def _provider_for_job_id(job_id: str, explicit: str | None, tracked) -> str:
         return tracked.provider
     if job_id.startswith("msgbatch_"):
         return "anthropic"
+    if job_id.startswith("batches/"):
+        return "gemini"
     if job_id.startswith("batch_"):
         return "openai"
     raise typer.BadParameter(
@@ -148,13 +164,18 @@ def process(
         ),
     ] = DEFAULT_CHECK_INTERVAL,
     provider: Annotated[
-        str, typer.Option("--provider", help="Batch provider: openai or anthropic")
+        str,
+        typer.Option("--provider", help="Batch provider: openai, anthropic, or gemini"),
     ] = "openai",
     endpoint: Annotated[
         str | None,
         typer.Option(
             help="Batch endpoint (e.g. /v1/chat/completions, /v1/responses, /v1/embeddings)"
         ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(help="Batch-level model for Gemini (e.g. gemini-3.6-flash)"),
     ] = None,
     submit_only: Annotated[
         bool,
@@ -165,7 +186,7 @@ def process(
     ] = False,
 ):
     """Process batch jobs from input files or directories."""
-    _validate_submission_options(provider, endpoint)
+    _validate_submission_options(provider, endpoint, model)
     _require_api_key(provider)
     output_dir = _default_output_dir(output_directory)
     batch_provider = get_provider(provider)
@@ -178,7 +199,7 @@ def process(
                 batch_provider, store, max_concurrent_jobs=max_concurrent_jobs
             )
             try:
-                return await orchestrator.submit_paths(input_paths, endpoint)
+                return await orchestrator.submit_paths(input_paths, endpoint, model)
             finally:
                 await batch_provider.close()
 
@@ -197,7 +218,7 @@ def process(
         )
         try:
             with dashboard:
-                await orchestrator.process(input_paths, output_dir, endpoint)
+                await orchestrator.process(input_paths, output_dir, endpoint, model)
         finally:
             await batch_provider.close()
 
@@ -211,16 +232,21 @@ def submit(
         list[Path], typer.Argument(help="Paths to input files or directories to submit")
     ],
     provider: Annotated[
-        str, typer.Option("--provider", help="Batch provider: openai or anthropic")
+        str,
+        typer.Option("--provider", help="Batch provider: openai, anthropic, or gemini"),
     ] = "openai",
     endpoint: Annotated[str | None, typer.Option(help="OpenAI Batch endpoint")] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(help="Batch-level model for Gemini (e.g. gemini-3.6-flash)"),
+    ] = None,
     max_concurrent_jobs: Annotated[
         int,
         typer.Option(min=1, help="Maximum number of concurrent submissions"),
     ] = DEFAULT_MAX_CONCURRENT_JOBS,
 ):
     """Submit batch jobs and exit immediately (use 'watch' to collect results later)."""
-    _validate_submission_options(provider, endpoint)
+    _validate_submission_options(provider, endpoint, model)
     _require_api_key(provider)
     batch_provider = get_provider(provider)
     store = JobStore(config.db_file)
@@ -230,7 +256,7 @@ def submit(
             batch_provider, store, max_concurrent_jobs=max_concurrent_jobs
         )
         try:
-            return await orchestrator.submit_paths(input_paths, endpoint)
+            return await orchestrator.submit_paths(input_paths, endpoint, model)
         finally:
             await batch_provider.close()
 

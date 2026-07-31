@@ -28,7 +28,7 @@ class FakeProvider:
         self.counter = 0
         self.status_scripts: dict[str, list[BatchStatus]] = {}
         self.files: dict[str, DownloadedResults] = {}
-        self.submitted: list[tuple[Path, str | None]] = []
+        self.submitted: list[tuple[Path, str | None, str | None]] = []
         self.fail_submit_for: set[str] = set()
         self.reject_submit_for: set[str] = set()
         self.fetch_failures: dict[str, int] = {}
@@ -41,12 +41,13 @@ class FakeProvider:
         input_file: Path,
         endpoint: str | None = None,
         intent_id: str | None = None,
+        model: str | None = None,
     ) -> SubmittedBatch:
         if input_file.name in self.reject_submit_for:
             raise ValueError("input rejected locally")
         if input_file.name in self.fail_submit_for:
             raise RuntimeError("upload exploded")
-        self.submitted.append((input_file, endpoint))
+        self.submitted.append((input_file, endpoint, model))
         self.counter += 1
         return SubmittedBatch(
             batch_id=f"batch_{self.counter}",
@@ -113,6 +114,22 @@ async def test_submit_records_jobs_in_manifest(store: JobStore, jsonl_dir: Path)
     assert all(j.endpoint == "/v1/responses" for j in pending)
 
 
+async def test_submit_carries_batch_level_model_through_to_manifest(
+    store: JobStore, jsonl_dir: Path
+):
+    provider = FakeProvider()
+    orchestrator = BatchOrchestrator(provider, store)
+
+    jobs = await orchestrator.submit_paths([jsonl_dir], model="gemini-3.6-flash")
+
+    assert all(model == "gemini-3.6-flash" for _, _, model in provider.submitted)
+    assert all(job.model == "gemini-3.6-flash" for job in jobs)
+    # the durable intent records the model before provider I/O, so an
+    # uncertain submission can be reconciled without guessing it
+    persisted = store.pending()
+    assert all(job.model == "gemini-3.6-flash" for job in persisted)
+
+
 async def test_uncertain_submit_failure_preserves_reconcilable_intent(
     store: JobStore, jsonl_dir: Path
 ):
@@ -147,12 +164,12 @@ async def test_submission_intent_exists_before_provider_call(
     store: JobStore, jsonl_dir: Path
 ):
     class InspectingProvider(FakeProvider):
-        async def submit(self, input_file, endpoint=None, intent_id=None):
+        async def submit(self, input_file, endpoint=None, intent_id=None, model=None):
             intent = store.get_intent(intent_id)
             assert intent is not None
             assert intent.state == JobState.SUBMITTING
             assert intent.batch_id is None
-            return await super().submit(input_file, endpoint, intent_id)
+            return await super().submit(input_file, endpoint, intent_id, model)
 
     jobs = await BatchOrchestrator(InspectingProvider(), store).submit_paths(
         [jsonl_dir / "a.jsonl"]

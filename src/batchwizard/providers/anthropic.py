@@ -56,10 +56,16 @@ class AnthropicBatchProvider:
         input_file: Path,
         endpoint: str | None = None,
         intent_id: str | None = None,
+        model: str | None = None,
     ) -> SubmittedBatch:
         if endpoint is not None:
             raise ValueError(
                 "--endpoint is OpenAI-specific and cannot be used with Anthropic"
+            )
+        if model is not None:
+            raise ValueError(
+                "--model is Gemini-specific; Anthropic batches read the model "
+                "from each row's params.model"
             )
         requests = _load_requests(input_file)
         batch = await self.client.messages.batches.create(

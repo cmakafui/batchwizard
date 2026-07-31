@@ -10,11 +10,25 @@ from batchwizard.config import BatchWizardSettings, Config
 def test_provider_keys_load_from_environment(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "openai-env")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-env")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-env")
 
     settings = BatchWizardSettings(_env_file=None)
 
     assert settings.openai_api_key == "openai-env"
     assert settings.anthropic_api_key == "anthropic-env"
+    assert settings.gemini_api_key == "gemini-env"
+
+
+def test_gemini_key_falls_back_to_google_api_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(typer, "get_app_dir", lambda name: str(tmp_path))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-env")
+    config = Config(settings=BatchWizardSettings(_env_file=None, gemini_api_key=None))
+
+    assert config.get_api_key("gemini") == "google-env"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-env")
+    assert config.get_api_key("gemini") == "gemini-env"
 
 
 def test_legacy_api_key_migrates_to_openai():

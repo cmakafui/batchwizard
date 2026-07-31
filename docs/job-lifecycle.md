@@ -60,8 +60,11 @@ failure survives process exit and is retried by a later invocation.
 - A provider-reported terminal status is stored before artifact collection begins.
 - A submission intent is committed before provider I/O. An uncertain submission
   outcome is never retried as a new batch automatically.
-- Downloads are streamed to a temporary file in the destination directory and
-  atomically renamed only after the stream completes.
+- Downloads are written to a temporary file in the destination directory and
+  atomically renamed only after the complete payload has been received.
+  Providers that support it stream into the temporary file; Gemini's SDK
+  returns the payload as buffered bytes, and the atomic exposure holds either
+  way.
 - A failed collection records `collection_state=failed` and remains actionable.
 - A provider-confirmed retention loss records `collection_state=unavailable` and
   stops retrying without pretending the artifacts were collected.
@@ -75,7 +78,10 @@ failure survives process exit and is retried by a later invocation.
 A provider adapter owns submission mechanics and native statuses, but exposes a
 small operational contract:
 
-- Submit a provider-native input file.
+- Submit a provider-native input file. The optional submission targets
+  (`endpoint` for OpenAI, a batch-level `model` for Gemini) are accepted only
+  by the adapter that uses them; the others reject them rather than silently
+  ignoring them.
 - Return a normalized status snapshot while preserving the raw status.
 - Fetch all available success and error artifacts idempotently.
 - Request cancellation and return its immediate status.
@@ -88,12 +94,15 @@ OpenAI exposes job-level terminal statuses. Anthropic exposes the neutral termin
 status `ended` and independent `succeeded`, `errored`, `canceled`, and `expired`
 request counts. BatchWizard maps `ended` to a terminal normalized lifecycle while
 preserving those row outcomes; an all-errored Anthropic batch is not rewritten as
-a remote provider failure.
+a remote provider failure. Gemini sits between the two: it has job-level
+terminal statuses, but `JOB_STATE_PARTIALLY_SUCCEEDED` is neutral in the same
+way as Anthropic's `ended` and is treated identically. Gemini's non-lifecycle
+states (`PAUSED`, `UPDATING`) are left unmapped so those jobs stay actionable.
 
 ## Schema migrations
 
 The SQLite manifest uses `PRAGMA user_version`. Opening a v0.4 manifest migrates it
-through schema versions 1, 2, and 3:
+through schema versions 1, 2, 3, and 4:
 
 - Active jobs start with artifact state `not_ready`.
 - Terminal jobs with an existing output or error path become `collected`.
@@ -104,6 +113,9 @@ through schema versions 1, 2, and 3:
 - Version 3 adds a unique submission intent, makes the provider batch ID and
   endpoint nullable until confirmation, and preserves existing rows with stable
   legacy intent IDs.
+- Version 4 adds a nullable `model` column for providers (Gemini) whose batch
+  API takes the model as a batch-level submission argument instead of reading
+  it from each JSONL row. Existing rows keep `NULL`.
 
 A manifest with a newer schema version is rejected rather than silently modified
 by an older BatchWizard release.
@@ -112,7 +124,8 @@ by an older BatchWizard release.
 
 Submission crosses the local manifest and a remote provider. BatchWizard writes a
 `submitting` intent first, then updates that same row after the provider returns
-its batch ID. OpenAI receives the intent ID as batch metadata, allowing
+its batch ID. OpenAI receives the intent ID as batch metadata, and Gemini
+receives it as the batch display name; both allow
 `batchwizard reconcile INTENT` to find and attach a batch after a crash or
 uncertain connection failure. Anthropic does not expose equivalent batch
 metadata; identify the matching job by creation time with `list-jobs`, then run

@@ -173,7 +173,7 @@ def test_v04_manifest_migrates_conservatively(tmp_path):
 
     store = JobStore(path)
 
-    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 4
     assert store.get("active").collection_state == CollectionState.NOT_READY
     assert store.get("with_files").collection_state == CollectionState.COLLECTED
     assert store.get("missing_files").collection_state == CollectionState.PENDING
@@ -186,6 +186,62 @@ def test_v04_manifest_migrates_conservatively(tmp_path):
     anthropic.provider = "anthropic"
     store.add(anthropic)
     assert store.get("active", provider="anthropic") is not None
+    store.close()
+
+
+def test_v3_manifest_gains_nullable_model_column(tmp_path):
+    path = tmp_path / "jobs.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            intent_id TEXT NOT NULL UNIQUE,
+            batch_id TEXT,
+            input_path TEXT NOT NULL,
+            endpoint TEXT,
+            state TEXT NOT NULL,
+            provider_status TEXT NOT NULL DEFAULT '',
+            collection_state TEXT NOT NULL DEFAULT 'not_ready',
+            completed_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            cancelled_count INTEGER NOT NULL DEFAULT 0,
+            expired_count INTEGER NOT NULL DEFAULT 0,
+            total_count INTEGER NOT NULL DEFAULT 0,
+            output_path TEXT,
+            error_path TEXT,
+            error_summary TEXT,
+            last_local_error TEXT,
+            poll_failures INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(provider, batch_id)
+        );
+        INSERT INTO jobs (
+            provider, intent_id, batch_id, input_path, state, created_at, updated_at
+        ) VALUES ('openai', 'intent-a', 'batch_old', '/tmp/a.jsonl',
+                  'running', '2026', '2026');
+        PRAGMA user_version = 3;
+        """
+    )
+    connection.close()
+
+    store = JobStore(path)
+
+    assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    migrated = store.get("batch_old")
+    assert migrated.model is None
+    assert migrated.intent_id == "intent-a"
+
+    gemini = JobRecord(
+        provider="gemini",
+        batch_id="batches/new",
+        input_path="/tmp/b.jsonl",
+        model="gemini-3.6-flash",
+    )
+    store.add(gemini)
+    assert store.get("batches/new").model == "gemini-3.6-flash"
     store.close()
 
 
